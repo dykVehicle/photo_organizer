@@ -92,22 +92,100 @@ class PhotoInfo:
     extra: Dict = field(default_factory=dict)
 
 
+import re as _re
+
+_EXIF_DATE_FORMATS = [
+    "%Y:%m:%d %H:%M:%S",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y/%m/%d %H:%M:%S",
+    "%Y:%m:%d",
+    "%Y-%m-%d",
+]
+_LOOSE_DATE_RE = _re.compile(
+    r"(\d{4})\D+(\d{1,2})\D+(\d{1,2})"
+    r"(?:\D+(\d{1,2})\D+(\d{1,2})(?:\D+(\d{1,2}))?)?"
+)
+
+
 def _parse_exif_datetime(value: str) -> Optional[datetime]:
-    formats = [
-        "%Y:%m:%d %H:%M:%S",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y/%m/%d %H:%M:%S",
-        "%Y:%m:%d",
-        "%Y-%m-%d",
-    ]
-    cleaned = value.strip().rstrip("\x00")
+    cleaned = str(value).strip().rstrip("\x00")
     if not cleaned or cleaned.startswith("0000"):
         return None
-    for fmt in formats:
+    for fmt in _EXIF_DATE_FORMATS:
         try:
             return datetime.strptime(cleaned, fmt)
         except ValueError:
             continue
+    m = _LOOSE_DATE_RE.search(cleaned)
+    if m:
+        try:
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            h = int(m.group(4)) if m.group(4) else 0
+            mi = int(m.group(5)) if m.group(5) else 0
+            s = int(m.group(6)) if m.group(6) else 0
+            if 1970 <= y <= 2099 and 1 <= mo <= 12 and 1 <= d <= 31:
+                return datetime(y, mo, d, h, mi, s)
+        except (ValueError, OverflowError):
+            pass
+    return None
+
+
+_FNAME_DATE_PATTERNS = [
+    # IMG_20120906_101406, VID_20190501_120000, C360_20140320_185103, Screenshot_20210101_120000
+    _re.compile(r"(?:IMG|VID|C360|Screenshot|PANO|MVIMG)_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})"),
+    # YYYYMMDD_HHMMSS (standalone)
+    _re.compile(r"^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})"),
+    # 2019-05-01 12.30.00 or 2019-05-01_12.30.00
+    _re.compile(r"(\d{4})-(\d{2})-(\d{2})[\s_](\d{2})\.(\d{2})\.(\d{2})"),
+    # IMG_20120906 (date only, no time)
+    _re.compile(r"(?:IMG|VID|C360|Screenshot|PANO)_(\d{4})(\d{2})(\d{2})(?!\d)"),
+]
+_FNAME_TS_PATTERN = _re.compile(r"mmexport(\d{10,13})")
+_FNAME_PURE_TS = _re.compile(r"^(\d{10}|\d{13})\b")
+
+
+def _parse_date_from_filename(filename: str) -> Optional[datetime]:
+    """从文件名中提取日期信息。支持 IMG_YYYYMMDD、mmexport 时间戳等常见格式。"""
+    stem = os.path.splitext(filename)[0]
+
+    for pat in _FNAME_DATE_PATTERNS:
+        m = pat.search(stem)
+        if m:
+            try:
+                groups = m.groups()
+                y, mo, d = int(groups[0]), int(groups[1]), int(groups[2])
+                h = int(groups[3]) if len(groups) > 3 and groups[3] else 0
+                mi = int(groups[4]) if len(groups) > 4 and groups[4] else 0
+                s = int(groups[5]) if len(groups) > 5 and groups[5] else 0
+                if 1970 <= y <= 2099 and 1 <= mo <= 12 and 1 <= d <= 31:
+                    return datetime(y, mo, d, h, mi, s)
+            except (ValueError, OverflowError):
+                continue
+
+    m = _FNAME_TS_PATTERN.search(stem)
+    if m:
+        ts_str = m.group(1)
+        ts = int(ts_str)
+        if len(ts_str) == 13:
+            ts = ts // 1000
+        if 946684800 <= ts <= 4102444800:  # 2000-01-01 ~ 2100-01-01
+            try:
+                return datetime.fromtimestamp(ts)
+            except (OSError, ValueError):
+                pass
+
+    m = _FNAME_PURE_TS.search(stem)
+    if m:
+        ts_str = m.group(1)
+        ts = int(ts_str)
+        if len(ts_str) == 13:
+            ts = ts // 1000
+        if 946684800 <= ts <= 4102444800:
+            try:
+                return datetime.fromtimestamp(ts)
+            except (OSError, ValueError):
+                pass
+
     return None
 
 
@@ -475,7 +553,21 @@ def read_photo_info(filepath: str) -> PhotoInfo:
     if gps_lat:
         info.extra["gps"] = gps_lat
 
+    if not info.make:
+        _infer_device_from_filename(info)
+
     return info
+
+
+def _infer_device_from_filename(info: PhotoInfo) -> None:
+    """根据文件名前缀推断设备（无 EXIF 品牌信息时的补充）"""
+    if info.make:
+        return
+    basename = os.path.basename(info.filepath)
+    name_lower = basename.lower()
+    if name_lower.startswith("c360_") or name_lower.startswith("http_imgload"):
+        info.make = "Xiaomi"
+        info.model = "MiOne"
 
 
 def _extract_gps(tags) -> str:
@@ -547,10 +639,28 @@ def _dict_to_photo_info(filepath: str, d: dict) -> PhotoInfo:
     )
 
 
-def _meta_cache_path_for_drive(drive: str) -> str:
-    """返回指定盘符的元数据缓存文件路径"""
-    cache_dir = os.path.join(drive + os.sep, _CACHE_DIR)
-    os.makedirs(cache_dir, exist_ok=True)
+def _try_make_cache_dir(base: str, subdir: str) -> Optional[str]:
+    """尝试在 base 下创建缓存目录，成功返回目录路径，失败返回 None"""
+    cache_dir = os.path.join(base, subdir)
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        return cache_dir
+    except OSError:
+        return None
+
+
+def _meta_cache_path_for_drive(drive: str, hint_paths: Optional[list] = None) -> Optional[str]:
+    """返回指定盘符的元数据缓存文件路径，无写入权限时沿扫描路径上溯"""
+    cache_dir = _try_make_cache_dir(drive + os.sep, _CACHE_DIR)
+    if not cache_dir and hint_paths:
+        for hp in sorted(hint_paths, key=len):
+            d = _try_make_cache_dir(hp, _CACHE_DIR)
+            if d:
+                cache_dir = d
+                break
+    if not cache_dir:
+        logger.debug(f"无法创建缓存目录 {drive}\\{_CACHE_DIR}，跳过该盘缓存")
+        return None
     return os.path.join(cache_dir, _META_CACHE_FILENAME)
 
 
@@ -591,82 +701,92 @@ def read_photo_infos_parallel(
     max_workers: int = 8,
     progress_callback=None,
 ) -> List[PhotoInfo]:
-    """多线程并行读取元数据信息（带磁盘缓存，mtime+size 未变的文件直接复用）。"""
+    """多线程并行读取元数据信息（按盘逐个处理，读完一个盘立即保存缓存）。"""
     results: List[Optional[PhotoInfo]] = [None] * len(filepaths)
 
     _get_ffprobe_path()
 
-    # ── 加载缓存，分离命中/未命中 ──
-    cache_paths: Dict[str, str] = {}
-    all_cached: Dict[str, dict] = {}
-    drives = {os.path.splitdrive(fp)[0].upper() for fp in filepaths if os.path.splitdrive(fp)[0]}
-    for drv in drives:
-        cp = _meta_cache_path_for_drive(drv)
-        cache_paths[drv] = cp
-        all_cached.update(_load_meta_cache(cp))
-
-    to_read: List[int] = []
-    cache_hits = 0
+    # ── 按盘符分组，记录每个文件在 results 中的索引 ──
+    drive_indices: Dict[str, List[int]] = {}
+    drive_dirs: Dict[str, List[str]] = {}
     for i, fp in enumerate(filepaths):
-        entry = all_cached.get(fp)
-        if entry:
-            try:
-                st = os.stat(fp)
-                if abs(st.st_mtime - entry["mtime"]) < 0.01 and st.st_size == entry["size"]:
-                    results[i] = _dict_to_photo_info(fp, entry["info"])
-                    cache_hits += 1
-                    if progress_callback:
-                        progress_callback()
-                    continue
-            except OSError:
-                pass
-        to_read.append(i)
+        drv = os.path.splitdrive(fp)[0].upper()
+        if drv:
+            drive_indices.setdefault(drv, []).append(i)
+            drive_dirs.setdefault(drv, []).append(os.path.dirname(fp))
 
-    if cache_hits:
-        logger.info(f"元数据缓存命中 {cache_hits}/{len(filepaths)} 个文件，"
-                     f"需读取: {len(to_read)} 个")
+    total_cache_hits = 0
 
-    # ── 仅对未命中缓存的文件读取元数据 ──
-    new_entries: Dict[str, dict] = {}
-    if to_read:
-        pool = ThreadPoolExecutor(max_workers=max_workers)
-        try:
-            futures = {pool.submit(read_photo_info, filepaths[i]): i for i in to_read}
-            for future in _interruptible_as_completed(futures):
-                idx = futures[future]
-                fp = filepaths[idx]
-                try:
-                    info = future.result()
-                except Exception:
-                    info = PhotoInfo(filepath=fp)
-                results[idx] = info
+    # ── 逐盘处理：加载缓存 → 读取 → 保存缓存 ──
+    for drv, indices in drive_indices.items():
+        unique_hints = sorted(set(drive_dirs[drv]), key=len)[:5]
+        cache_path = _meta_cache_path_for_drive(drv, unique_hints)
+        cached = _load_meta_cache(cache_path) if cache_path else {}
+
+        to_read: List[int] = []
+        cache_hits = 0
+        for i in indices:
+            fp = filepaths[i]
+            entry = cached.get(fp)
+            if entry:
                 try:
                     st = os.stat(fp)
-                    new_entries[fp] = {
-                        "mtime": st.st_mtime,
-                        "size": st.st_size,
-                        "info": _photo_info_to_dict(info),
-                    }
+                    if abs(st.st_mtime - entry["mtime"]) < 0.01 and st.st_size == entry["size"]:
+                        results[i] = _dict_to_photo_info(fp, entry["info"])
+                        cache_hits += 1
+                        if progress_callback:
+                            progress_callback()
+                        continue
                 except OSError:
                     pass
-                if progress_callback:
-                    progress_callback()
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
+            to_read.append(i)
+
+        total_cache_hits += cache_hits
+
+        new_entries: Dict[str, dict] = {}
+        if to_read:
+            pool = ThreadPoolExecutor(max_workers=max_workers)
+            try:
+                futures = {pool.submit(read_photo_info, filepaths[i]): i for i in to_read}
+                for future in _interruptible_as_completed(futures):
+                    idx = futures[future]
+                    fp = filepaths[idx]
+                    try:
+                        info = future.result()
+                    except Exception:
+                        info = PhotoInfo(filepath=fp)
+                    results[idx] = info
+                    try:
+                        st = os.stat(fp)
+                        new_entries[fp] = {
+                            "mtime": st.st_mtime,
+                            "size": st.st_size,
+                            "info": _photo_info_to_dict(info),
+                        }
+                    except OSError:
+                        pass
+                    if progress_callback:
+                        progress_callback()
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
+
+        # 立即保存该盘缓存
+        if cache_path:
+            valid_entries: Dict[str, dict] = {}
+            for i in indices:
+                fp = filepaths[i]
+                entry = new_entries.get(fp) or cached.get(fp)
+                if entry:
+                    valid_entries[fp] = entry
+            if valid_entries:
+                _save_meta_cache(cache_path, valid_entries)
+
+    if total_cache_hits:
+        logger.info(f"元数据缓存命中 {total_cache_hits}/{len(filepaths)} 个文件，"
+                     f"需读取: {len(filepaths) - total_cache_hits} 个")
 
     for i, r in enumerate(results):
         if r is None:
             results[i] = PhotoInfo(filepath=filepaths[i])
-
-    # ── 保存更新后的缓存（按盘符分别保存） ──
-    valid_entries_by_drive: Dict[str, Dict[str, dict]] = {drv: {} for drv in drives}
-    for fp in filepaths:
-        drv = os.path.splitdrive(fp)[0].upper()
-        entry = new_entries.get(fp) or all_cached.get(fp)
-        if entry:
-            valid_entries_by_drive.setdefault(drv, {})[fp] = entry
-    for drv, entries in valid_entries_by_drive.items():
-        if entries and drv in cache_paths:
-            _save_meta_cache(cache_paths[drv], entries)
 
     return results  # type: ignore

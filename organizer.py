@@ -1,6 +1,5 @@
 """文件整理模块：复制、去重、目录管理、设备过滤（三阶段并行优化）"""
 
-import hashlib
 import json
 import logging
 import os
@@ -11,11 +10,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COM
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
+try:
+    import xxhash
+    _USE_XXHASH = True
+except ImportError:
+    import hashlib
+    _USE_XXHASH = False
+
 from tqdm import tqdm
 
 import config
 from classifier import DeviceType, classify_device, is_target_device
-from exif_reader import PhotoInfo
+from exif_reader import PhotoInfo, _parse_date_from_filename
 from interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
@@ -24,7 +30,7 @@ BUF_SIZE = 1024 * 1024
 CACHE_DIR = ".photo_organizer"
 HASH_CACHE_FILENAME = "hash_cache.json"
 SRC_HASH_CACHE_FILENAME = "src_hash_cache.json"
-_HASH_CACHE_VERSION = 1
+_HASH_CACHE_VERSION = 2  # v2: xxhash + 16KB sample (v1 was MD5 + 64KB)
 
 
 def _load_hash_cache(cache_path: str) -> Dict[str, dict]:
@@ -178,6 +184,9 @@ def _build_device_label(info: PhotoInfo) -> str:
 def _get_effective_date(info: PhotoInfo, device_type: DeviceType):
     if info.has_exif_date and info.date_taken:
         return info.date_taken, True
+    fname_date = _parse_date_from_filename(os.path.basename(info.filepath))
+    if fname_date:
+        return fname_date, True
     if device_type == DeviceType.UNKNOWN and info.file_modified:
         return info.file_modified, False
     return None, False
@@ -220,22 +229,27 @@ def _resolve_conflict(dest_path: str, assigned: Optional[Set[str]] = None) -> st
         counter += 1
 
 
-HASH_SAMPLE_SIZE = 64 * 1024  # 64 KB
+HASH_SAMPLE_SIZE = 16 * 1024  # 16 KB（从 64KB 减少，单次 SMB 读取即可完成）
 
 
 def _file_fast_hash(filepath: str, file_size: int) -> str:
     """
-    快速去重哈希：file_size + 首 64KB + 尾 64KB。
-    对 20MB 的照片只读 128KB（提速 ~150x），碰撞概率可忽略。
+    快速去重哈希：file_size + 首 16KB + 尾 16KB。
+    使用 xxhash（比 MD5 快 ~10x），碰撞概率可忽略。
+    小文件（≤32KB）只读一次，避免 seek 开销。
     """
-    h = hashlib.md5()
-    h.update(str(file_size).encode())
+    if _USE_XXHASH:
+        h = xxhash.xxh3_64()
+    else:
+        import hashlib
+        h = hashlib.md5()
+    h.update(file_size.to_bytes(8, "little"))
     with open(filepath, "rb") as f:
         head = f.read(HASH_SAMPLE_SIZE)
         h.update(head)
         if file_size > HASH_SAMPLE_SIZE * 2:
             f.seek(-HASH_SAMPLE_SIZE, 2)
-            h.update(f.read(HASH_SAMPLE_SIZE))
+            h.update(f.read())
     return h.hexdigest()
 
 
@@ -405,19 +419,21 @@ def _prepare_one(
         item.needs_copy = False
         return item
 
-    # ── 计算哈希（带源盘缓存） ──
+    # ── 计算哈希（带源盘缓存，复用 PhotoInfo 已有的 size/mtime 避免额外 stat） ──
     try:
-        st = os.stat(info.filepath)
-        if src_hash_entries:
+        file_mtime = info.file_modified.timestamp() if info.file_modified else None
+        if src_hash_entries and file_mtime is not None:
             cached = src_hash_entries.get(info.filepath)
             if (cached
-                    and abs(st.st_mtime - cached["mtime"]) < 0.01
-                    and st.st_size == cached["size"]):
+                    and abs(file_mtime - cached["mtime"]) < 0.01
+                    and info.file_size == cached["size"]):
                 item.file_hash = cached["hash"]
-                item._file_mtime = st.st_mtime
+                item._file_mtime = file_mtime
                 return item
-        item.file_hash = _file_fast_hash(info.filepath, st.st_size)
-        item._file_mtime = st.st_mtime
+        item.file_hash = _file_fast_hash(info.filepath, info.file_size)
+        if file_mtime is None:
+            file_mtime = os.stat(info.filepath).st_mtime
+        item._file_mtime = file_mtime
     except Exception as e:
         record.status = "error"
         record.error_msg = f"计算哈希失败: {e}"
@@ -654,11 +670,29 @@ def copy_photos_parallel(
     # ── 加载源盘哈希缓存 ──
     src_hash_entries: Dict[str, dict] = {}
     src_cache_paths: Dict[str, str] = {}
-    src_drives = {os.path.splitdrive(info.filepath)[0].upper()
-                  for info in photo_infos if os.path.splitdrive(info.filepath)[0]}
-    for drv in src_drives:
-        cache_dir = os.path.join(drv + os.sep, CACHE_DIR)
-        os.makedirs(cache_dir, exist_ok=True)
+    paths_by_drive: Dict[str, list] = {}
+    for info in photo_infos:
+        drv = os.path.splitdrive(info.filepath)[0].upper()
+        if drv:
+            paths_by_drive.setdefault(drv, []).append(os.path.dirname(info.filepath))
+    for drv, hint_paths in paths_by_drive.items():
+        cache_dir = None
+        root_dir = os.path.join(drv + os.sep, CACHE_DIR)
+        try:
+            os.makedirs(root_dir, exist_ok=True)
+            cache_dir = root_dir
+        except OSError:
+            for hp in sorted(set(hint_paths), key=len)[:5]:
+                fallback = os.path.join(hp, CACHE_DIR)
+                try:
+                    os.makedirs(fallback, exist_ok=True)
+                    cache_dir = fallback
+                    break
+                except OSError:
+                    continue
+        if not cache_dir:
+            logger.debug(f"无法创建缓存目录 {drv}\\{CACHE_DIR}，跳过该盘哈希缓存")
+            continue
         cp = os.path.join(cache_dir, SRC_HASH_CACHE_FILENAME)
         src_cache_paths[drv] = cp
         src_hash_entries.update(_load_hash_cache(cp))
@@ -702,7 +736,7 @@ def copy_photos_parallel(
             pool.shutdown(wait=False, cancel_futures=True)
 
     # ── 保存源盘哈希缓存 ──
-    valid_by_drive: Dict[str, Dict[str, dict]] = {drv: {} for drv in src_drives}
+    valid_by_drive: Dict[str, Dict[str, dict]] = {drv: {} for drv in paths_by_drive}
     for item in items:
         if item and item.file_hash and item._file_mtime:
             fp = item.info.filepath
@@ -737,8 +771,30 @@ def copy_photos_parallel(
                 needs_copy=False,
             )
 
+    # ── 阶段 2-0：扫描目标盘已有文件，建立哈希索引 ──
+    dest_drive = os.path.splitdrive(config.DEST_CAMERA)[0].upper() + os.sep
+    reuse_index: Optional[Dict[str, str]] = None
+    dup_files: List[str] = []
+    if dest_drive and os.path.isdir(dest_drive):
+        reuse_index, dup_files = _scan_dest_drive_for_reuse(dest_drive, max_workers)
+
     # ── 阶段 2：串行去重 + 冲突解决 ──
+    # 只将**输出目录内**的已有文件加入 seen_hashes（防止重复运行时产生 _po 后缀）
+    # 输出目录外的文件保留在 reuse_index 中供同盘移动复用
     seen_hashes: Dict[str, str] = {}  # hash → 首个文件路径
+    if reuse_index:
+        output_root = os.path.normcase(config.REPORT_DIR) + os.sep
+        in_output = 0
+        for h, fp in reuse_index.items():
+            if os.path.normcase(fp).startswith(output_root):
+                seen_hashes[h] = fp
+                in_output += 1
+        if in_output:
+            logger.info(f"输出目录已有 {in_output} 个唯一文件，重复源文件将自动跳过")
+        outside = len(reuse_index) - in_output
+        if outside:
+            logger.info(f"目标盘其余 {outside} 个文件可用于同盘复用")
+
     assigned_dests: Set[str] = set()  # 本批次已分配的目标路径（normcase）
     to_copy: List[_PreparedItem] = []
 
@@ -768,12 +824,8 @@ def copy_photos_parallel(
 
     # ── 阶段 3：并行复制 ──
     if to_copy:
-        # 3-0) 扫描目标盘已有文件，建立同盘复用索引
-        dest_drive = os.path.splitdrive(to_copy[0].record.destination)[0].upper() + os.sep
-        reuse_index: Optional[Dict[str, str]] = None
-        dup_files: List[str] = []
-        if dest_drive and os.path.isdir(dest_drive):
-            reuse_index, dup_files = _scan_dest_drive_for_reuse(dest_drive, max_workers)
+        # 3-0) 统计同盘复用
+        if reuse_index:
             reuse_count = sum(1 for item in to_copy if item.file_hash and item.file_hash in reuse_index)
             if reuse_count:
                 logger.info(f"可同盘复用: {reuse_count}/{len(to_copy)} 个文件（秒移，无需跨盘复制）")
@@ -843,22 +895,22 @@ def copy_photos_parallel(
                 parts.append(f"写入复制: {write_count} 个 ({write_mb:.0f}MB, {write_speed:.1f}MB/s)")
             logger.info(", ".join(parts))
 
-        # 3-4) 删除目标盘上的重复文件（同哈希多余副本）
-        if dup_files:
-            dup_deleted = 0
-            dup_bytes = 0
-            for fp in dup_files:
-                try:
-                    if os.path.isfile(fp):
-                        sz = os.path.getsize(fp)
-                        os.remove(fp)
-                        dup_deleted += 1
-                        dup_bytes += sz
-                except OSError:
-                    pass
-            if dup_deleted:
-                logger.info(f"删除目标盘重复文件: {dup_deleted} 个, "
-                             f"释放 {_human_size(dup_bytes)}")
+    # 删除目标盘上的重复文件（同哈希多余副本，无论是否有新文件要复制）
+    if dup_files:
+        dup_deleted = 0
+        dup_bytes = 0
+        for fp in dup_files:
+            try:
+                if os.path.isfile(fp):
+                    sz = os.path.getsize(fp)
+                    os.remove(fp)
+                    dup_deleted += 1
+                    dup_bytes += sz
+            except OSError:
+                pass
+        if dup_deleted:
+            logger.info(f"删除目标盘重复文件: {dup_deleted} 个, "
+                         f"释放 {_human_size(dup_bytes)}")
 
     # ── 汇总结果 ──
     result = OrganizeResult(total_found=total)
@@ -1082,3 +1134,54 @@ def _backfill_filelists(dest_roots: set) -> None:
 
     if backfilled:
         logger.info(f"补全历史文件夹 filelist.txt: {backfilled} 个")
+
+
+# ── 修复 _po 后缀文件 ──
+
+_PO_SUFFIX_RE = re.compile(r"_po(\d+)(\.[^.]+)$", re.IGNORECASE)
+
+
+def restore_po_files(output_root: str) -> None:
+    """扫描输出目录，将 _poN 后缀的文件恢复为原始文件名。"""
+    if not os.path.isdir(output_root):
+        logger.error(f"目录不存在: {output_root}")
+        return
+
+    renamed = 0
+    deleted_dup = 0
+    skipped = 0
+
+    for dirpath, _dirs, files in os.walk(output_root):
+        for fn in files:
+            m = _PO_SUFFIX_RE.search(fn)
+            if not m:
+                continue
+
+            po_path = os.path.join(dirpath, fn)
+            original_name = _PO_SUFFIX_RE.sub(r"\2", fn)
+            original_path = os.path.join(dirpath, original_name)
+
+            if not os.path.exists(original_path):
+                try:
+                    os.rename(po_path, original_path)
+                    renamed += 1
+                except OSError as e:
+                    logger.warning(f"重命名失败: {fn} → {original_name}: {e}")
+                    skipped += 1
+            else:
+                try:
+                    po_size = os.path.getsize(po_path)
+                    orig_size = os.path.getsize(original_path)
+                    if po_size == orig_size:
+                        po_hash = _file_fast_hash(po_path, po_size)
+                        orig_hash = _file_fast_hash(original_path, orig_size)
+                        if po_hash == orig_hash:
+                            os.remove(po_path)
+                            deleted_dup += 1
+                            continue
+                except OSError:
+                    pass
+                skipped += 1
+
+    logger.info(f"修复 _po 后缀文件完成: "
+                f"重命名恢复 {renamed} 个, 删除重复 {deleted_dup} 个, 跳过 {skipped} 个")

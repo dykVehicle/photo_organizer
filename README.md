@@ -24,7 +24,7 @@
 
 默认模式（仅复制目标设备）：
 ```
-H:\All_相册_20260225\
+H:\All_相册_20260225_V2\
   ├── All_1_手机照片\
   │   ├── 2024-Q1-M1-2-3_Xiaomi 14\
   │   └── 2024-Q3-M7-8-9_Apple iPhone 15 Pro\
@@ -41,7 +41,7 @@ H:\All_相册_20260225\
 
 `--copy-all` 模式（复制所有设备，自动区分目标/其他）：
 ```
-H:\All_相册_20260225\
+H:\All_相册_20260225_V2\
   ├── All_1_目标设备_手机照片\       ← 目标设备（如 Xiaomi、Apple…）
   │   └── 2024-Q1-M1-2-3_Xiaomi 14\
   ├── All_2_目标设备_相机照片\
@@ -58,7 +58,7 @@ H:\All_相册_20260225\
 `filelist.txt` 示例（ASCII 表头 + `|` 分隔，严格对齐）：
 ```
 # 文件列表 — 共 3 个文件
-# 目标目录: H:\All_相册_20260225\All_2_目标设备_相机照片\2024-Q1-M1-2-3_Canon EOS R5
+# 目标目录: H:\All_相册_20260225_V2\All_2_目标设备_相机照片\2024-Q1-M1-2-3_Canon EOS R5
 # 列: 文件名(Filename) | 拍摄时间(Date) | 大小(Size) | 设备(Device) | 参数(Params) | 镜头(Lens) | GPS(GPS) | 原始路径(Source)
 #
 Filename      | Date                | Size    | Device       | Params                   | Lens            | GPS           | Source
@@ -84,26 +84,26 @@ pip install -r requirements.txt
 
 ```bash
 # 默认设备 + 也复制未识别照片（不加 --copy-all 则按默认品牌过滤）
-python main.py --copy-unknown-photo --output-dir "H:\All_相册_20260225" --scan-dirs "E:\小米14_dyk"
+python main.py --copy-unknown-photo --output-dir "H:\All_相册_20260225_V2" --scan-dirs "E:\小米14_dyk"
 
-python main.py --copy-unknown-photo --output-dir "H:\All_相册_20260225" --scan-dirs "E:\小米14_dyk" "E:\相册_E" "F:\相册_F" "G:\相册_G" "I:\相册_I" "S:\media_3t\相册_rpi"
+python main.py --copy-unknown-photo --output-dir "H:\All_相册_20260225_V2" --scan-dirs "E:\小米14_dyk" "E:\相册_E" "F:\相册_F" "G:\相册_G" "I:\相册_I" "S:\media_3t\相册_rpi"
 
 # 不限设备 + 也复制未识别的照片（不含未识别视频）
-python main.py --copy-all --copy-unknown-photo --scan-dirs "E:\小米14_dyk" --output-dir "H:\All_相册_20260225"
+python main.py --copy-all --copy-unknown-photo --scan-dirs "E:\小米14_dyk" --output-dir "H:\All_相册_20260225_V2"
 
-python main.py --copy-all --copy-unknown-photo --output-dir "H:\All_相册_20260225" --scan-dirs "E:\小米14_dyk" "E:\相册_E" "F:\相册_F" "G:\相册_G" "I:\相册_I" "S:\media_3t\相册_rpi"
+python main.py --copy-all --copy-unknown-photo --output-dir "H:\All_相册_20260225_V2" --scan-dirs "E:\小米14_dyk" "E:\相册_E" "F:\相册_F" "G:\相册_G" "I:\相册_I" "S:\media_3t\相册_rpi"
 
 # 不限设备 + 也复制未识别的视频（不含未识别照片）
-python main.py --copy-all --copy-unknown-video --scan-dirs "E:\小米14_dyk" --output-dir "H:\All_相册_20260225"
+python main.py --copy-all --copy-unknown-video --scan-dirs "E:\小米14_dyk" --output-dir "H:\All_相册_20260225_V2"
 
 # 不限设备 + 复制全部未识别文件（照片+视频）= 复制一切
-python main.py --copy-all --copy-unknown --scan-dirs "E:\小米14_dyk" --output-dir "H:\All_相册_20260225"
+python main.py --copy-all --copy-unknown --scan-dirs "E:\小米14_dyk" --output-dir "H:\All_相册_20260225_V2"
 
 # 只复制小米+苹果 + 同时复制未识别照片
-python main.py --devices xiaomi,apple --copy-unknown-photo --scan-dirs "E:\小米14_dyk" --output-dir "H:\All_相册_20260225"
+python main.py --devices xiaomi,apple --copy-unknown-photo --scan-dirs "E:\小米14_dyk" --output-dir "H:\All_相册_20260225_V2"
 
 # 扫描 E 盘，不限设备，复制一切，64 线程
-python main.py --scan-dirs "E:\" --copy-all --copy-unknown --workers 64 --output-dir "H:\All_相册_20260225"
+python main.py --scan-dirs "E:\" --copy-all --copy-unknown --workers 64 --output-dir "H:\All_相册_20260225_V2"
 ```
 
 ### 高级选项
@@ -119,7 +119,7 @@ python main.py --no-exclude --include-hidden
 python main.py --dest-drive "F:\"
 
 # 指定完整输出目录（已有目录则续写，不再自动生成时间戳文件夹）
-python main.py --output-dir "H:\All_相册_20260225" --scan-dirs "E:\小米14_dyk"
+python main.py --output-dir "H:\All_相册_20260225_V2" --scan-dirs "E:\小米14_dyk"
 
 # 试运行（不实际复制，仅生成报告）
 python main.py --dry-run --scan-dirs "E:\小米14_dyk"
@@ -174,7 +174,7 @@ python main.py --copy-unknown --scan-dirs "E:\小米14_dyk"
 |---|---|---|
 | `--scan-dirs` | 所有磁盘 | 自定义扫描目录（空格分隔多个路径） |
 | `--dest-drive` | `H:\` | 输出根盘符 |
-| `--output-dir` | 自动生成 | 指定完整输出目录路径（如 `H:\All_相册_20260225`） |
+| `--output-dir` | 自动生成 | 指定完整输出目录路径（如 `H:\All_相册_20260225_V2`） |
 | `--workers` | 32 | 并行线程数 |
 | `--devices` | xiaomi,redmi,apple,huawei,honor,samsung,canon,dji | 目标设备品牌（逗号分隔） |
 | `--copy-all` | False | 跳过品牌过滤，复制所有已识别设备的文件 |

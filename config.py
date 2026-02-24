@@ -112,6 +112,7 @@ SONY_CAMERA_MODEL_KEYWORDS = {
     "ilce", "dsc", "slta", "nex", "alpha",
     "a7", "a6", "a9", "a1", "a99",
     "rx", "zv-e", "fx",
+    "dslr", "slt-",
 }
 
 # ── 手机品牌关键词（Make 字段，小写匹配） ──
@@ -134,6 +135,10 @@ PHONE_BRANDS = {
     "nokia", "hmd global",
     "tecno", "infinix", "itel",
     "fairphone",
+    "spreadtrum",
+    "corelogic",
+    "doov",
+    "sony ericsson",
 }
 
 SONY_PHONE_MODEL_KEYWORDS = {
@@ -278,18 +283,39 @@ DEFAULT_TARGET_BRANDS = {
 # 型号级匹配：make+model 组合精确匹配（小写比较）
 # 格式: "品牌 型号" 或 "品牌_型号"，匹配时用 (make + " " + model).lower() 包含检查
 DEFAULT_TARGET_MODELS = {
+    # 相机
     "canon eos 700d",
     "canon eos 550d",
     "canon eos rp",
+    "canon eos 5d mark ii",
+    "canon eos 5d mark iii",
+    "canon eos 5d mark iv",
     "sony dsc-tx100",
     "sony dsc-hx400",
+    "sony dsc-wx10",
+    "sony ilce-7rm2",
     "nikon d3300",
     "nikon d3x",
     "nikon d7100",
+    "nikon d7000",
+    "nikon d70s",
+    "nikon d3100",
     "nikon d90",
     "fujifilm x-t20",
+    "panasonic dmc-fh7",
+    "pentax k-50",
+    # 手机
     "oppo u705t",
+    "oppo finder",
     "vivo x6d",
+    "vivo x20a",
+    "spreadtrum sp8810ga",
+    "nokia 6120c",
+    "nokia 5233",
+    "meizu m1",
+    "sony ericsson w595c",
+    "corelogic samsung",
+    "doov s1",
 }
 
 # 合并用于向后兼容（--devices 命令行参数仍按品牌匹配）

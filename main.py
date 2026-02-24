@@ -86,6 +86,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--include-hidden", action="store_true", help="也扫描 . 开头的隐藏目录")
     p.add_argument("--dry-run", action="store_true", help="试运行模式，不实际复制文件")
     p.add_argument("--verbose", "-v", action="store_true", help="显示详细日志")
+    p.add_argument("--fix-po", action="store_true",
+                   help="修复之前错误产生的 _po 后缀文件（重命名回原始名称）")
 
     return p.parse_args()
 
@@ -217,6 +219,11 @@ def main() -> None:
     root_dir = _init_dest_paths(args)
     report_dir = config.REPORT_DIR
     workers = args.workers
+
+    if args.fix_po:
+        from organizer import restore_po_files
+        restore_po_files(root_dir)
+        return
 
     # 解析目标设备列表
     if args.devices:
