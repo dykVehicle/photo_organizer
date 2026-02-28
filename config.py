@@ -19,6 +19,7 @@ DEST_TARGET_CAMERA_NAME = "All_2_目标设备_相机照片"
 DEST_OTHER_PHONE_NAME = "All_3_其他设备_手机照片"
 DEST_OTHER_CAMERA_NAME = "All_4_其他设备_相机照片"
 DEST_OTHER_UNKNOWN_NAME = "All_5_其他设备_未识别设备照片"
+DEST_NSFW_NAME = "All_6_NSFW"
 
 # 运行时由 main.py 设置的完整路径（不要手动修改）
 DEST_CAMERA = ""
@@ -26,6 +27,7 @@ DEST_PHONE = ""
 DEST_UNKNOWN = ""
 DEST_CAMERA_OTHER = ""
 DEST_PHONE_OTHER = ""
+DEST_NSFW = ""
 REPORT_DIR = ""
 
 NO_EXIF_DATE_FOLDER = "未知日期_无EXIF"

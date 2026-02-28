@@ -115,6 +115,7 @@ class OrganizeResult:
     skipped_filtered: int = 0
     skipped_not_target: int = 0
     skipped_no_device: int = 0
+    nsfw_count: int = 0
     errors: int = 0
 
 
@@ -333,6 +334,7 @@ class _PreparedItem:
     needs_copy: bool = True
     is_target: bool = True
     _file_mtime: float = 0.0
+    nsfw_score: float = -1.0  # -1 表示未检测
 
 
 def _make_record(info: PhotoInfo, device_type: DeviceType, is_target: bool = True) -> CopyRecord:
@@ -619,8 +621,11 @@ def _do_copy(item: _PreparedItem, reuse_index: Optional[Dict[str, str]] = None) 
     src = item.info.filepath
 
     # 优先：reuse_index 命中 → rename 旧文件到新位置（秒移，零 I/O）
+    # NSFW 文件不用 reuse（移动会导致原始文件丢失，删 NSFW 目录后不可恢复）
+    nsfw_dest = config.DEST_NSFW and os.path.normcase(dest).startswith(
+        os.path.normcase(config.DEST_NSFW))
     reused = False
-    if reuse_index and item.file_hash:
+    if reuse_index and item.file_hash and not nsfw_dest:
         existing = None
         with _reuse_lock:
             existing = reuse_index.pop(item.file_hash, None)
@@ -649,6 +654,228 @@ def _do_copy(item: _PreparedItem, reuse_index: Optional[Dict[str, str]] = None) 
             item.record.error_msg = str(e)
 
 
+def _build_nsfw_dest(item: _PreparedItem) -> str:
+    """为 NSFW 文件构建目标路径: All_6_NSFW/{原始分类路径}，保留设备/时间目录结构"""
+    original_dest = item.record.destination
+    output_root = config.REPORT_DIR
+    try:
+        rel = os.path.relpath(original_dest, output_root)
+    except ValueError:
+        rel = os.path.basename(original_dest)
+    return os.path.join(config.DEST_NSFW, rel)
+
+
+def _load_nsfw_cache(cache_path: str) -> dict:
+    """加载 NSFW 分数缓存 {file_hash: score}"""
+    if os.path.isfile(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            logger.info("NSFW 缓存命中 %d 条: %s", len(data), cache_path)
+            return data
+        except Exception as e:
+            logger.debug("NSFW 缓存加载失败: %s", e)
+    return {}
+
+
+def _save_nsfw_cache(cache_path: str, cache: dict) -> None:
+    """增量保存 NSFW 分数缓存"""
+    try:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+        logger.info("NSFW 缓存已保存: %d 条 → %s", len(cache), cache_path)
+    except Exception as e:
+        logger.debug("NSFW 缓存保存失败: %s", e)
+
+
+def _run_nsfw_detection(items: List[_PreparedItem], detector, max_workers: int):
+    """阶段 1.5：双缓冲流水线 NSFW 检测（GPU 推理与 CPU 预处理并行，支持缓存断点续测）"""
+    from nsfw_detector import _preprocess_single
+    from concurrent.futures import as_completed
+    import numpy as np
+
+    from nsfw_detector import _RAW_EXTENSIONS
+    image_exts = config.IMAGE_EXTENSIONS
+    video_exts = config.VIDEO_EXTENSIONS
+
+    image_items = []
+    video_items = []
+    raw_skipped = 0
+    for it in items:
+        if not it.needs_copy:
+            continue
+        ext = os.path.splitext(it.info.filepath)[1].lower()
+        if ext in _RAW_EXTENSIONS:
+            raw_skipped += 1
+            continue
+        if ext in image_exts:
+            image_items.append(it)
+        elif ext in video_exts:
+            video_items.append(it)
+
+    # 按路径排序减少 HDD 磁头跳转
+    image_items.sort(key=lambda it: it.info.filepath)
+
+    total = len(image_items) + len(video_items)
+    if total == 0:
+        return
+    if raw_skipped:
+        logger.info(f"NSFW 跳过 RAW 文件: {raw_skipped} 个（CR2/CR3/NEF/ARW 等不检测）")
+
+    # ── 加载 NSFW 缓存（放在目标盘根目录，跨输出目录复用）──
+    dest_drive = os.path.splitdrive(config.DEST_CAMERA or config.REPORT_DIR)[0]
+    if dest_drive:
+        cache_dir = os.path.join(dest_drive + os.sep, CACHE_DIR)
+    elif config.REPORT_DIR:
+        cache_dir = os.path.join(config.REPORT_DIR, CACHE_DIR)
+    else:
+        cache_dir = ""
+    cache_path = os.path.join(cache_dir, "nsfw_score_cache.json") if cache_dir else ""
+    nsfw_cache = _load_nsfw_cache(cache_path) if cache_path else {}
+
+    _original_cached = set(nsfw_cache.keys())
+    cached_count = 0
+    need_detect_images = []
+    need_detect_videos = []
+    for it in image_items:
+        h = it.file_hash
+        if h and h in nsfw_cache:
+            it.nsfw_score = nsfw_cache[h]
+            cached_count += 1
+        else:
+            need_detect_images.append(it)
+    for it in video_items:
+        h = it.file_hash
+        if h and h in nsfw_cache:
+            it.nsfw_score = nsfw_cache[h]
+            cached_count += 1
+        else:
+            need_detect_videos.append(it)
+
+    need_total = len(need_detect_images) + len(need_detect_videos)
+
+    BATCH_SIZE = 256
+    PREPROCESS_WORKERS = min(max_workers, 8)
+    VIDEO_WORKERS = min(max_workers, 4)
+
+    logger.info(
+        f"NSFW 检测: {len(image_items)} 图片 + {len(video_items)} 视频, "
+        f"缓存命中 {cached_count}, 需检测 {need_total} "
+        f"(batch={BATCH_SIZE}, {PREPROCESS_WORKERS} 预处理线程)"
+    )
+
+    nsfw_found = sum(1 for it in image_items + video_items
+                     if it.nsfw_score >= detector.threshold)
+    save_interval = 2000
+
+    with tqdm(total=total, desc="NSFW 检测", unit="个", initial=cached_count) as pbar:
+        # ── 图片：双缓冲流水线 ──
+        if need_detect_images and not is_interrupted():
+            detector._ensure_model()
+            pool = ThreadPoolExecutor(max_workers=PREPROCESS_WORKERS)
+
+            batches = [need_detect_images[i:i + BATCH_SIZE]
+                       for i in range(0, len(need_detect_images), BATCH_SIZE)]
+
+            def _submit_preprocess(batch_items):
+                return [(it, pool.submit(_preprocess_single, it.info.filepath))
+                        for it in batch_items]
+
+            pending = _submit_preprocess(batches[0])
+            processed_since_save = 0
+
+            for bi in range(len(batches)):
+                if is_interrupted():
+                    break
+
+                current = pending
+                if bi + 1 < len(batches):
+                    pending = _submit_preprocess(batches[bi + 1])
+
+                arrays, valid_items = [], []
+                for it, fut in current:
+                    arr = fut.result()
+                    if arr is not None:
+                        arrays.append(arr)
+                        valid_items.append(it)
+
+                if arrays:
+                    try:
+                        scores = detector.run_batch_inference(np.stack(arrays))
+                    except Exception as e:
+                        logger.debug("NSFW batch 推理异常: %s", e)
+                        scores = [0.0] * len(arrays)
+                    for it, score in zip(valid_items, scores):
+                        it.nsfw_score = score
+                        if it.file_hash:
+                            nsfw_cache[it.file_hash] = score
+
+                batch_len = len(batches[bi])
+                pbar.update(batch_len)
+                processed_since_save += batch_len
+                if cache_path and processed_since_save >= save_interval:
+                    _save_nsfw_cache(cache_path, nsfw_cache)
+                    processed_since_save = 0
+
+            pool.shutdown(wait=False)
+
+        # ── 图片阶段 2：NudeNet 精检（只检 Falconsai 粗筛通过的） ──
+        coarse_thr = detector.COARSE_THRESHOLD
+        suspect_images = [it for it in image_items
+                         if it.nsfw_score >= coarse_thr and it.file_hash not in _original_cached]
+        if suspect_images and not is_interrupted():
+            logger.info("NudeNet 精检: %d 张可疑图片 (Falconsai >= %.1f)", len(suspect_images), coarse_thr)
+            detector._ensure_nudenet()
+            for i, it in enumerate(suspect_images):
+                if is_interrupted():
+                    break
+                fine_score = detector.nudenet_check_image(it.info.filepath)
+                it.nsfw_score = fine_score
+                if it.file_hash:
+                    nsfw_cache[it.file_hash] = fine_score
+                if fine_score >= detector.threshold:
+                    nsfw_found += 1
+                if (i + 1) % 50 == 0:
+                    logger.info("  NudeNet 精检进度: %d/%d", i + 1, len(suspect_images))
+                    if cache_path:
+                        _save_nsfw_cache(cache_path, nsfw_cache)
+
+        # ── 视频：两阶段抽帧检测 ──
+        if need_detect_videos and not is_interrupted():
+            def _detect_video(it):
+                try:
+                    return detector.predict_video(it.info.filepath, max_frames=3)
+                except Exception:
+                    return 0.0
+
+            vpool = ThreadPoolExecutor(max_workers=VIDEO_WORKERS)
+            futs = {vpool.submit(_detect_video, it): it for it in need_detect_videos}
+            processed_since_save = 0
+            for fut in as_completed(futs):
+                if is_interrupted():
+                    break
+                it = futs[fut]
+                it.nsfw_score = fut.result()
+                if it.file_hash:
+                    nsfw_cache[it.file_hash] = it.nsfw_score
+                if it.nsfw_score >= detector.threshold:
+                    nsfw_found += 1
+                pbar.update(1)
+                processed_since_save += 1
+                if cache_path and processed_since_save >= save_interval:
+                    _save_nsfw_cache(cache_path, nsfw_cache)
+                    processed_since_save = 0
+            vpool.shutdown(wait=False)
+
+    # 最终保存缓存
+    if cache_path and nsfw_cache:
+        _save_nsfw_cache(cache_path, nsfw_cache)
+
+    nsfw_found = sum(1 for it in image_items + video_items if it.nsfw_score >= detector.threshold)
+    logger.info(f"NSFW 检测完成: 检出 {nsfw_found} 个 NSFW 文件")
+
+
 def copy_photos_parallel(
     photo_infos: List[PhotoInfo],
     max_workers: int = 8,
@@ -658,12 +885,14 @@ def copy_photos_parallel(
     copy_unknown: bool = False,
     copy_unknown_photo: bool = False,
     copy_unknown_video: bool = False,
+    nsfw_detector=None,
 ) -> OrganizeResult:
     """
-    三阶段并行整理：
-      1. 并行：分类 + 设备过滤 + 小图过滤 + 计算 MD5
-      2. 串行：去重 + 路径冲突解决
-      3. 并行：复制文件
+    多阶段并行整理：
+      1.   并行：分类 + 设备过滤 + 小图过滤 + 计算哈希
+      1.5  NSFW batch 检测（GPU 加速，仅 --nsfw 时）
+      2.   串行：去重 + 路径冲突解决 + NSFW 路由
+      3.   并行：复制文件
     """
     total = len(photo_infos)
 
@@ -771,6 +1000,10 @@ def copy_photos_parallel(
                 needs_copy=False,
             )
 
+    # ── 阶段 1.5：NSFW batch 检测（GPU 加速） ──
+    if nsfw_detector and not is_interrupted():
+        _run_nsfw_detection(items, nsfw_detector, max_workers)
+
     # ── 阶段 2-0：扫描目标盘已有文件，建立哈希索引 ──
     dest_drive = os.path.splitdrive(config.DEST_CAMERA)[0].upper() + os.sep
     reuse_index: Optional[Dict[str, str]] = None
@@ -798,19 +1031,33 @@ def copy_photos_parallel(
     assigned_dests: Set[str] = set()  # 本批次已分配的目标路径（normcase）
     to_copy: List[_PreparedItem] = []
 
+    nsfw_prefix = (os.path.normcase(config.DEST_NSFW) + os.sep) if config.DEST_NSFW else ""
+
     for item in items:
         if not item.needs_copy:
             continue
 
         item.record.file_hash = item.file_hash
 
-        if item.file_hash in seen_hashes:
-            item.record.status = "skipped_dup"
-            item.record.dup_of = seen_hashes[item.file_hash]
-            item.needs_copy = False
-            continue
+        # NSFW 路由优先于去重：先确定目标路径
+        is_nsfw = (nsfw_detector and item.nsfw_score >= nsfw_detector.threshold and config.DEST_NSFW)
+        if is_nsfw:
+            item.record.destination = _build_nsfw_dest(item)
 
-        seen_hashes[item.file_hash] = item.info.filepath
+        if item.file_hash in seen_hashes:
+            existing = seen_hashes[item.file_hash]
+            # NSFW 文件：仅当 All_6_NSFW 内已有同哈希文件时才跳过
+            if is_nsfw and nsfw_prefix and not os.path.normcase(existing).startswith(nsfw_prefix):
+                pass  # 原位置已有但 NSFW 目录没有，仍需复制
+            else:
+                item.record.status = "skipped_dup"
+                item.record.dup_of = existing
+                item.needs_copy = False
+                continue
+
+        # NSFW 文件记录目标路径，防止同文件重复绕过去重
+        seen_hashes[item.file_hash] = item.record.destination if is_nsfw else item.info.filepath
+
         resolved = _resolve_conflict(item.record.destination, assigned_dests)
         item.record.destination = resolved
         assigned_dests.add(os.path.normcase(resolved))
@@ -913,11 +1160,14 @@ def copy_photos_parallel(
                          f"释放 {_human_size(dup_bytes)}")
 
     # ── 汇总结果 ──
+    nsfw_root = os.path.normcase(config.DEST_NSFW + os.sep) if config.DEST_NSFW else ""
     result = OrganizeResult(total_found=total)
     result.records = [item.record for item in items]
     for record in result.records:
         if record.status in ("ok", "dry_run"):
             result.copied += 1
+            if nsfw_root and os.path.normcase(record.destination).startswith(nsfw_root):
+                result.nsfw_count += 1
         elif record.status == "skipped_dup":
             result.skipped_dup += 1
         elif record.status == "skipped_exists":
@@ -936,6 +1186,8 @@ def copy_photos_parallel(
 
     # ── 补全历史文件夹缺失的 filelist.txt ──
     dest_roots = {config.DEST_CAMERA, config.DEST_PHONE, config.DEST_UNKNOWN}
+    if config.DEST_NSFW:
+        dest_roots.add(config.DEST_NSFW)
     if config.DEST_CAMERA_OTHER:
         dest_roots.update({config.DEST_CAMERA_OTHER, config.DEST_PHONE_OTHER})
     _backfill_filelists(dest_roots)

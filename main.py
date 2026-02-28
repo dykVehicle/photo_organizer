@@ -89,6 +89,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fix-po", action="store_true",
                    help="修复之前错误产生的 _po 后缀文件（重命名回原始名称）")
 
+    p.add_argument("--nsfw", action="store_true", default=True,
+                   help="启用 NSFW 两阶段检测（默认开启）")
+    p.add_argument("--no-nsfw", action="store_false", dest="nsfw",
+                   help="禁用 NSFW 检测")
+    p.add_argument("--nsfw-threshold", type=float, default=0.5,
+                   help="NSFW 检测阈值 0.0~1.0（默认 0.5），概率超过此值判定为 NSFW")
+
     return p.parse_args()
 
 
@@ -115,6 +122,7 @@ def _init_dest_paths(args) -> str:
         config.DEST_CAMERA_OTHER = ""
         config.DEST_PHONE_OTHER = ""
 
+    config.DEST_NSFW = os.path.join(root, config.DEST_NSFW_NAME)
     config.REPORT_DIR = args.report_dir or root
     return root
 
@@ -262,6 +270,19 @@ def main() -> None:
     else:
         logger.info("未识别文件: 仅记录在报告中，不复制")
 
+    # ── NSFW 检测初始化 ──
+    nsfw_detector = None
+    if args.nsfw:
+        try:
+            from nsfw_detector import check_dependencies, NsfwDetector
+            check_dependencies()
+            nsfw_detector = NsfwDetector(threshold=args.nsfw_threshold)
+            logger.info("NSFW 检测: 已启用（阈值 %.2f）→ %s", args.nsfw_threshold, config.DEST_NSFW)
+        except ImportError as e:
+            logger.warning("NSFW 检测依赖未安装，已跳过: %s", e)
+    else:
+        logger.info("NSFW 检测: 已禁用（--no-nsfw）")
+
     if args.dry_run:
         logger.info("=== 试运行模式：不会实际复制文件 ===")
 
@@ -335,6 +356,7 @@ def main() -> None:
             copy_unknown=args.copy_unknown,
             copy_unknown_photo=args.copy_unknown_photo,
             copy_unknown_video=args.copy_unknown_video,
+            nsfw_detector=nsfw_detector,
         )
 
         for record in result.records:
@@ -342,9 +364,10 @@ def main() -> None:
                 logger.warning("处理失败: %s → %s", record.source, record.error_msg)
 
         copy_time = time.time() - t2
+        nsfw_msg = f", NSFW {result.nsfw_count}" if result.nsfw_count else ""
         logger.info(
-            "整理完成: 复制 %d, 重复跳过 %d, 非目标 %d, 无设备 %d, 小图过滤 %d, 错误 %d, 耗时 %.1f 秒",
-            result.copied, result.skipped_dup, result.skipped_not_target,
+            "整理完成: 复制 %d%s, 重复跳过 %d, 非目标 %d, 无设备 %d, 小图过滤 %d, 错误 %d, 耗时 %.1f 秒",
+            result.copied, nsfw_msg, result.skipped_dup, result.skipped_not_target,
             result.skipped_no_device, result.skipped_filtered, result.errors, copy_time,
         )
 
@@ -372,6 +395,8 @@ def main() -> None:
         logger.info("%s", "中断后报告已生成!" if interrupted else "全部完成!")
         logger.info("  发现文件:   %d 个", result.total_found)
         logger.info("  成功复制:   %d 个", result.copied)
+        if result.nsfw_count:
+            logger.info("  NSFW 检出:  %d 个", result.nsfw_count)
         logger.info("  重复跳过:   %d 个", result.skipped_dup)
         logger.info("  小图过滤:   %d 个", result.skipped_filtered)
         logger.info("  非目标设备: %d 个", result.skipped_not_target)
