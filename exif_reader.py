@@ -131,17 +131,44 @@ def _parse_exif_datetime(value: str) -> Optional[datetime]:
 
 
 _FNAME_DATE_PATTERNS = [
-    # IMG_20120906_101406, VID_20190501_120000, C360_20140320_185103, Screenshot_20210101_120000
+    # ── 带前缀 + 完整日期时间 ──
+    # IMG_20120906_101406, VID_20190501_120000, Screenshot_20210101_120000
     _re.compile(r"(?:IMG|VID|C360|Screenshot|PANO|MVIMG)_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})"),
-    # YYYYMMDD_HHMMSS (standalone)
+    # ── 无前缀 + 完整日期时间 ──
+    # YYYYMMDD_HHMMSS
     _re.compile(r"^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})"),
-    # 2019-05-01 12.30.00 or 2019-05-01_12.30.00
-    _re.compile(r"(\d{4})-(\d{2})-(\d{2})[\s_](\d{2})\.(\d{2})\.(\d{2})"),
-    # IMG_20120906 (date only, no time)
-    _re.compile(r"(?:IMG|VID|C360|Screenshot|PANO)_(\d{4})(\d{2})(\d{2})(?!\d)"),
+    # YYYY_MM_DD_HH_MM_SS 或 YYYY_MM_DD_HH_MM
+    _re.compile(r"^(\d{4})_(\d{2})_(\d{2})_(\d{2})_(\d{2})(?:_(\d{2}))?"),
+    # YYYY-MM-DD + 时间（分隔符灵活：. : - 或无）
+    _re.compile(r"(\d{4})-(\d{2})-(\d{2})[\s_T](\d{2})[:\-.]?(\d{2})[:\-.]?(\d{2})"),
+    # ── 带前缀 + 仅日期 ──
+    # IMG_20120906, DSC_20190501, DSCN1234 等常见相机前缀
+    _re.compile(r"(?:IMG|VID|C360|Screenshot|PANO|DSC|DSCN|DSCF|SAM)_(\d{4})(\d{2})(\d{2})(?!\d)"),
+    # ── 仅日期（灵活分隔符） ──
+    # YYYY-MM-DD 或 YYYY_MM_DD
+    _re.compile(r"(?<!\d)(\d{4})[-_](\d{2})[-_](\d{2})(?!\d)"),
+    # ── 仅日期（8 位连写） ──
+    # YYYYMMDD（独立 8 位数字，不属于更长数字的一部分）
+    _re.compile(r"(?<!\d)(\d{4})(\d{2})(\d{2})(?!\d)"),
 ]
-_FNAME_TS_PATTERN = _re.compile(r"mmexport(\d{10,13})")
-_FNAME_PURE_TS = _re.compile(r"^(\d{10}|\d{13})\b")
+# 带已知前缀的时间戳
+_FNAME_TS_PATTERN = _re.compile(r"(?:mmexport|wx_camera|wx)_?(\d{10,13})")
+# 任意位置的独立 10/13 位时间戳
+_FNAME_PURE_TS = _re.compile(r"(?<!\d)(\d{10}|\d{13})(?!\d)")
+
+
+_NOW_TS = datetime.now().timestamp() + 86400  # 当前时间 + 1 天容差
+_MAX_YEAR = datetime.now().year  # 最多允许当年
+
+
+def _ts_to_datetime(ts: int) -> Optional[datetime]:
+    """将 Unix 秒级时间戳转换为 datetime，拒绝未来时间"""
+    if 738892800 <= ts <= _NOW_TS:  # 1993-06-01 ~ 运行时刻+1天
+        try:
+            return datetime.fromtimestamp(ts)
+        except (OSError, ValueError):
+            pass
+    return None
 
 
 def _parse_date_from_filename(filename: str) -> Optional[datetime]:
@@ -157,7 +184,7 @@ def _parse_date_from_filename(filename: str) -> Optional[datetime]:
                 h = int(groups[3]) if len(groups) > 3 and groups[3] else 0
                 mi = int(groups[4]) if len(groups) > 4 and groups[4] else 0
                 s = int(groups[5]) if len(groups) > 5 and groups[5] else 0
-                if 1970 <= y <= 2099 and 1 <= mo <= 12 and 1 <= d <= 31:
+                if 1993 <= y <= _MAX_YEAR and 1 <= mo <= 12 and 1 <= d <= 31:
                     return datetime(y, mo, d, h, mi, s)
             except (ValueError, OverflowError):
                 continue
@@ -168,11 +195,9 @@ def _parse_date_from_filename(filename: str) -> Optional[datetime]:
         ts = int(ts_str)
         if len(ts_str) == 13:
             ts = ts // 1000
-        if 946684800 <= ts <= 4102444800:  # 2000-01-01 ~ 2100-01-01
-            try:
-                return datetime.fromtimestamp(ts)
-            except (OSError, ValueError):
-                pass
+        dt = _ts_to_datetime(ts)
+        if dt:
+            return dt
 
     m = _FNAME_PURE_TS.search(stem)
     if m:
@@ -180,11 +205,9 @@ def _parse_date_from_filename(filename: str) -> Optional[datetime]:
         ts = int(ts_str)
         if len(ts_str) == 13:
             ts = ts // 1000
-        if 946684800 <= ts <= 4102444800:
-            try:
-                return datetime.fromtimestamp(ts)
-            except (OSError, ValueError):
-                pass
+        dt = _ts_to_datetime(ts)
+        if dt:
+            return dt
 
     return None
 
@@ -601,7 +624,7 @@ def _extract_gps(tags) -> str:
 # ── 元数据缓存 ──
 _CACHE_DIR = ".photo_organizer"
 _META_CACHE_FILENAME = "meta_cache.json"
-_META_CACHE_VERSION = 1
+_META_CACHE_VERSION = 2  # v2: 修复华为等设备 EXIF 日期带中文后缀解析
 
 
 def _photo_info_to_dict(info: PhotoInfo) -> dict:

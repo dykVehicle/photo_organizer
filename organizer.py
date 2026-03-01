@@ -8,6 +8,7 @@ import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Dict, List, Optional, Set
 
 try:
@@ -156,40 +157,73 @@ def _sanitize_folder_name(name: str) -> str:
 
 
 def _build_device_label(info: PhotoInfo) -> str:
-    parts = []
-    if info.make:
-        parts.append(info.make.strip())
-    if info.model:
-        model = info.model.strip()
-        make_lower = info.make.lower().strip() if info.make else ""
-        if make_lower and model.lower().startswith(make_lower):
-            model = model[len(make_lower):].strip()
-        if model:
-            make_str = info.make.strip() if info.make else ""
-            marketing = config.XIAOMI_MODEL_NAMES.get(model.lower())
-            if marketing:
-                if marketing.lower().startswith(make_str.lower()):
-                    parts = [f"{marketing} {model}"]
-                else:
-                    parts = [f"{make_str} {marketing} {model}"]
-            else:
-                full_name = f"{make_str} {model}".strip().lower()
-                code = config._XIAOMI_NAME_TO_CODE.get(full_name)
-                if code:
-                    parts = [f"{make_str} {model} {code}"]
-                else:
-                    parts.append(model)
-    return _sanitize_folder_name(" ".join(parts)) if parts else "未知型号"
+    make = info.make.strip() if info.make else ""
+    model = info.model.strip() if info.model else ""
+    make_lower = make.lower()
+
+    # 1. Make 规范化（如 "NIKON CORPORATION" → "Nikon"）
+    normalized = config.MAKE_NORMALIZE.get(make_lower)
+    if normalized:
+        make = normalized
+        make_lower = make.lower()
+
+    # 2. 去除 model 中重复的 make 前缀（如 Nikon "NIKON D70s" → "D70s"）
+    model_lower = model.lower()
+    if make_lower and model_lower.startswith(make_lower):
+        model = model[len(make_lower):].strip()
+        model_lower = model.lower()
+
+    # 3. Model 别名规范化（合并变体，如 "mione_plus" → "MiOne"）
+    alias = config.MODEL_ALIASES.get(model_lower)
+    if alias:
+        model = alias
+        model_lower = model.lower()
+
+    if not make and not model:
+        return "未知型号"
+
+    # 4. 按品牌查找营销名
+    marketing = None
+    if any(kw in make_lower for kw in ("xiaomi", "redmi", "poco")):
+        marketing = config.XIAOMI_MODEL_NAMES.get(model_lower)
+        if not marketing:
+            code = config._XIAOMI_NAME_TO_CODE.get(f"{make_lower} {model_lower}".strip())
+            if code:
+                return _sanitize_folder_name(f"{make} {model} {code}")
+    elif "huawei" in make_lower:
+        marketing = config.HUAWEI_MODEL_NAMES.get(model_lower)
+    elif "samsung" in make_lower:
+        marketing = config.SAMSUNG_MODEL_NAMES.get(model_lower)
+
+    # 5. 构建标签
+    if marketing and model:
+        if marketing.lower().startswith(make_lower):
+            return _sanitize_folder_name(f"{marketing} {model}")
+        return _sanitize_folder_name(f"{make} {marketing} {model}")
+    elif make and model:
+        return _sanitize_folder_name(f"{make} {model}")
+    else:
+        return _sanitize_folder_name(make or model)
+
+
+_MIN_REASONABLE_YEAR = 1993
+from datetime import timedelta as _timedelta
+_MAX_REASONABLE_DATE = datetime.now() + _timedelta(days=1)
+
+
+def _is_reasonable_date(dt: datetime) -> bool:
+    return dt.year >= _MIN_REASONABLE_YEAR and dt <= _MAX_REASONABLE_DATE
 
 
 def _get_effective_date(info: PhotoInfo, device_type: DeviceType):
+    # 优先级: EXIF 日期 > 文件修改时间 > 文件名日期
     if info.has_exif_date and info.date_taken:
         return info.date_taken, True
+    if info.file_modified and _is_reasonable_date(info.file_modified):
+        return info.file_modified, True
     fname_date = _parse_date_from_filename(os.path.basename(info.filepath))
     if fname_date:
         return fname_date, True
-    if device_type == DeviceType.UNKNOWN and info.file_modified:
-        return info.file_modified, False
     return None, False
 
 
@@ -201,10 +235,10 @@ def _build_dest_path(device_type: DeviceType, info: PhotoInfo, is_target: bool =
     if device_type in (DeviceType.CAMERA, DeviceType.PHONE):
         device_label = _build_device_label(info)
         if effective_date:
-            date_folder = f"{effective_date.year}-{_quarter_label(effective_date.month)}_{device_label}"
-            return os.path.join(root, date_folder, filename)
+            date_folder = f"{effective_date.year}-{_quarter_label(effective_date.month)}"
+            return os.path.join(root, device_label, date_folder, filename)
         else:
-            return os.path.join(root, f"{config.NO_EXIF_DATE_FOLDER}_{device_label}", filename)
+            return os.path.join(root, device_label, config.NO_EXIF_DATE_FOLDER, filename)
     else:
         if effective_date:
             date_folder = f"{effective_date.year}-{_quarter_label(effective_date.month)}"

@@ -149,6 +149,97 @@ SONY_PHONE_MODEL_KEYWORDS = {
 
 AMBIGUOUS_BRANDS = {"sony", "sony corporation"}
 
+# ── Make 名称规范化（key: make.lower().strip(), value: 显示名称）──
+MAKE_NORMALIZE = {
+    "nikon corporation": "Nikon",
+    "nikon": "Nikon",
+    "olympus optical co.,ltd": "Olympus",
+    "olympus corporation": "Olympus",
+    "om digital solutions": "OM System",
+    "samsung": "Samsung",
+    "xiaomi": "Xiaomi",
+}
+
+# ── 型号别名规范化（key: model小写, value: 统一显示名）──
+# 用于合并相近设备名称变体，在营销名查找之前应用
+MODEL_ALIASES = {
+    # Xiaomi Mi 1 系列 → 统一为 MiOne（随后由 XIAOMI_MODEL_NAMES 映射到 "Mi 1"）
+    "mi-one plus": "MiOne",
+    "mione_plus": "MiOne",
+    "mione_plus_": "MiOne",
+    # Xiaomi 型号大小写规范
+    "mi 6": "Mi 6",
+    "mi4": "Mi 4",
+    "mi note": "Mi Note",
+    "hm note": "Redmi Note",
+    "hm note 1td": "Redmi Note 1TD",
+    "redmi note 5a": "Redmi Note 5A",
+    # Apple 内部代号 → 营销名
+    "iphone9,1": "iPhone 7",
+    "iphone9,3": "iPhone 7",
+    "iphone10,1": "iPhone 8",
+    "iphone10,4": "iPhone 8",
+    "iphone10,2": "iPhone 8 Plus",
+    "iphone10,5": "iPhone 8 Plus",
+    "iphone10,3": "iPhone X",
+    "iphone10,6": "iPhone X",
+    "iphone11,2": "iPhone XS",
+    "iphone11,8": "iPhone XR",
+    "iphone12,1": "iPhone 11",
+    "iphone12,3": "iPhone 11 Pro",
+    "iphone12,5": "iPhone 11 Pro Max",
+    "iphone13,1": "iPhone 12 mini",
+    "iphone13,2": "iPhone 12",
+    "iphone13,3": "iPhone 12 Pro",
+    "iphone13,4": "iPhone 12 Pro Max",
+    "iphone14,4": "iPhone 13 mini",
+    "iphone14,5": "iPhone 13",
+    "iphone14,2": "iPhone 13 Pro",
+    "iphone14,3": "iPhone 13 Pro Max",
+    # Samsung 型号大小写
+    "pl170,pl171 / vluupl170,pl171": "PL170",
+}
+
+# ── HUAWEI 型号 → 营销名映射 ──
+HUAWEI_MODEL_NAMES = {
+    # P 系列
+    "ana-an00": "P40",
+    "ele-al00": "P30",
+    "clt-al00": "P20 Pro",
+    "clt-al01": "P20 Pro",
+    # Mate 系列
+    "lio-al00": "Mate 30 Pro",
+    "lya-al00": "Mate 20 Pro",
+    "bla-al00": "Mate 10 Pro",
+    "mha-al00": "Mate 9",
+    "mt7-cl00": "Mate 7",
+    # Honor 系列
+    "oxf-an10": "Honor V30 Pro",
+    "pct-al10": "Honor V20",
+    "frd-al10": "Honor 8",
+    "knt-ul10": "Honor V8",
+    "bln-al40": "Honor 6X",
+    "che1-cl10": "Honor 4X",
+    # Nova / Enjoy 系列
+    "par-al00": "Nova 3",
+    "dig-al00": "Enjoy 6S",
+    "tit-cl10": "Enjoy 5",
+    # 其他
+    "c8813dq": "Ascend Y530",
+    "c8817d": "Honor 3C Play",
+}
+
+# ── Samsung 型号 → 营销名映射 ──
+SAMSUNG_MODEL_NAMES = {
+    "gt-i9100": "Galaxy S II",
+    "gt-i9500": "Galaxy S4",
+    "gt-s5830i": "Galaxy Ace",
+    "sgh-i917": "Focus",
+    "sm-g9350": "Galaxy S7 Edge",
+    "sm-g9600": "Galaxy S9",
+    "sm-j7008": "Galaxy J7",
+}
+
 # ── 小米/红米/POCO 型号代码 → 营销名映射（用于文件夹命名美化） ──
 # key: 型号代码小写, value: 营销名（会拼接在代码前面，如 "Xiaomi 14 23127PN0CC"）
 XIAOMI_MODEL_NAMES = {
@@ -201,6 +292,7 @@ XIAOMI_MODEL_NAMES = {
     "m2001j2c": "Mi 10",
     "m2007j1sc": "Mi 10 Ultra",
     "m2102j2sc": "Mi 10S",
+    "m2002j9e": "Mi 10 Lite",
     "m1902f1g": "Mi 9",
     "m1902f1c": "Mi 9",
     "m1903f2g": "Mi 9 SE",

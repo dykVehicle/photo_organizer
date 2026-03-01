@@ -9,7 +9,9 @@
 - 视频元数据读取：ffprobe 优先 → 内置 MP4/MOV 解析器回退 → 同目录照片推断兜底
 - 智能设备分类：相机、手机、未识别
 - **设备过滤**：默认只复制指定品牌，其余仅记录在报告中
-- 已识别设备：按 **日期+设备名** 单层归档（如 `2024-Q1-M1-2-3_Canon EOS R5`），照片视频同目录
+- 已识别设备：按 **设备名/日期** 两级归档（如 `Canon EOS R5/2024-Q1-M1-2-3/`），照片视频同目录
+- **营销名映射**：HUAWEI/Samsung/Xiaomi 等型号自动添加营销名（如 `HUAWEI P40 ANA-AN00`）
+- **设备名合并**：自动统一相近设备名变体（如 MiOne/MI-ONE Plus → `Xiaomi Mi 1 MiOne`）
 - 小图过滤：自动排除表情包/缩略图（<100KB 或 <300px）
 - 文件去重（快速哈希：文件大小 + 首尾 64KB）
 - 重复文件对比：报告中展示每个重复文件与原始文件的哈希对比
@@ -27,14 +29,18 @@
 ```
 H:\All_相册\
   ├── All_1_手机照片\
-  │   ├── 2024-Q1-M1-2-3_Xiaomi 14\
-  │   └── 2024-Q3-M7-8-9_Apple iPhone 15 Pro\
+  │   ├── Xiaomi 14 23127PN0CC\
+  │   │   ├── 2024-Q1-M1-2-3\
+  │   │   └── 2024-Q3-M7-8-9\
+  │   └── Apple iPhone 15 Pro\
+  │       └── 2024-Q3-M7-8-9\
+  │           ├── IMG_0001.HEIC
+  │           └── filelist.txt       ← 记录每个文件的原始路径
   ├── All_2_相机照片\
-  │   ├── 2024-Q1-M1-2-3_Canon EOS R5\
-  │   │   ├── IMG_0001.CR3
-  │   │   ├── MVI_0002.MP4
-  │   │   └── filelist.txt       ← 记录每个文件的原始路径
-  │   └── 2024-Q3-M7-8-9_DJI Mavic 3\
+  │   ├── Canon EOS R5\
+  │   │   └── 2024-Q1-M1-2-3\
+  │   └── DJI Mavic 3\
+  │       └── 2024-Q3-M7-8-9\
   ├── All_3_未识别设备照片\          ← 需 --copy-unknown 才会有
   ├── 整理报告_xxx.html
   └── 整理报告_xxx.csv
@@ -44,14 +50,20 @@ H:\All_相册\
 ```
 H:\All_相册\
   ├── All_1_目标设备_手机照片\       ← 目标设备（如 Xiaomi、Apple…）
-  │   └── 2024-Q1-M1-2-3_Xiaomi 14\
+  │   ├── HUAWEI P40 ANA-AN00\      ← 自动添加营销名
+  │   │   └── 2024-Q1-M1-2-3\
+  │   └── Xiaomi 14 23127PN0CC\
+  │       └── 2024-Q1-M1-2-3\
   ├── All_2_目标设备_相机照片\
-  │   └── 2024-Q1-M1-2-3_Canon EOS R5\
+  │   └── Canon EOS R5\
+  │       └── 2024-Q1-M1-2-3\
   ├── All_3_其他设备_手机照片\       ← 非目标设备
-  │   └── 2024-Q2-M4-5-6_Oppo Find X7\
+  │   └── OPPO Find X7\
+  │       └── 2024-Q2-M4-5-6\
   ├── All_4_其他设备_相机照片\
-  │   └── 2024-Q3-M7-8-9_Pentax K-1\
-  ├── All_5_其他设备_未识别设备照片\  ← 未识别设备
+  │   └── Nikon D750\               ← 简化 "NIKON CORPORATION NIKON D750"
+  │       └── 2024-Q3-M7-8-9\
+  ├── All_5_其他设备_未识别设备照片\  ← 未识别设备（按时间分文件夹）
   ├── All_6_NSFW\                    ← 需 --nsfw 才会有
   ├── 整理报告_xxx.html
   └── 整理报告_xxx.csv
@@ -60,7 +72,7 @@ H:\All_相册\
 `filelist.txt` 示例（ASCII 表头 + `|` 分隔，严格对齐）：
 ```
 # 文件列表 — 共 3 个文件
-# 目标目录: H:\All_相册\All_2_目标设备_相机照片\2024-Q1-M1-2-3_Canon EOS R5
+# 目标目录: H:\All_相册\All_2_目标设备_相机照片\Canon EOS R5\2024-Q1-M1-2-3
 # 列: 文件名(Filename) | 拍摄时间(Date) | 大小(Size) | 设备(Device) | 参数(Params) | 镜头(Lens) | GPS(GPS) | 原始路径(Source)
 #
 Filename      | Date                | Size    | Device       | Params                   | Lens            | GPS           | Source
