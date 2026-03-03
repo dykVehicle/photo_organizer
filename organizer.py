@@ -34,6 +34,38 @@ SRC_HASH_CACHE_FILENAME = "src_hash_cache.json"
 _HASH_CACHE_VERSION = 2  # v2: xxhash + 16KB sample (v1 was MD5 + 64KB)
 
 
+def _time_match(entry: dict, mtime: float, ctime: float = 0.0) -> bool:
+    """缓存时间戳匹配：当前文件的 mtime/ctime 任一与缓存中的 mtime/ctime 任一匹配即命中。
+    兼容复制后文件只保留 mtime 或 ctime 的情况。"""
+    tol = 0.01
+    cached_mtime = entry.get("mtime", 0.0)
+    cached_ctime = entry.get("ctime", 0.0)
+    candidates = [t for t in (cached_mtime, cached_ctime) if t > 0]
+    for cur in (mtime, ctime):
+        if cur <= 0:
+            continue
+        for ref in candidates:
+            if abs(cur - ref) < tol:
+                return True
+    return False
+
+
+def _get_backup_cache_dir():
+    """获取目标盘上的统一备份缓存目录"""
+    ref = config.REPORT_DIR or config.DEST_CAMERA
+    if not ref:
+        return None
+    drv = os.path.splitdrive(ref)[0]
+    if not drv:
+        return None
+    d = os.path.join(drv + os.sep, CACHE_DIR)
+    try:
+        os.makedirs(d, exist_ok=True)
+        return d
+    except OSError:
+        return None
+
+
 def _load_hash_cache(cache_path: str) -> Dict[str, dict]:
     """从磁盘加载哈希缓存，返回 {filepath: {hash, mtime, size}} 字典"""
     try:
@@ -180,30 +212,55 @@ def _build_device_label(info: PhotoInfo) -> str:
         model_lower = model.lower()
 
     if not make and not model:
-        return "未知型号"
-
-    # 4. 按品牌查找营销名
-    marketing = None
-    if any(kw in make_lower for kw in ("xiaomi", "redmi", "poco")):
-        marketing = config.XIAOMI_MODEL_NAMES.get(model_lower)
-        if not marketing:
-            code = config._XIAOMI_NAME_TO_CODE.get(f"{make_lower} {model_lower}".strip())
-            if code:
-                return _sanitize_folder_name(f"{make} {model} {code}")
-    elif "huawei" in make_lower:
-        marketing = config.HUAWEI_MODEL_NAMES.get(model_lower)
-    elif "samsung" in make_lower:
-        marketing = config.SAMSUNG_MODEL_NAMES.get(model_lower)
-
-    # 5. 构建标签
-    if marketing and model:
-        if marketing.lower().startswith(make_lower):
-            return _sanitize_folder_name(f"{marketing} {model}")
-        return _sanitize_folder_name(f"{make} {marketing} {model}")
-    elif make and model:
-        return _sanitize_folder_name(f"{make} {model}")
+        label = "未知型号"
     else:
-        return _sanitize_folder_name(make or model)
+        # 4. 按品牌查找营销名
+        marketing = None
+        if "dji" in make_lower:
+            merged = config.DJI_MODEL_NAMES.get(model_lower)
+            if not merged:
+                writing_app = (info.extra.get("writing_application") or "").lower()
+                for app_key, name in config.DJI_APP_NAMES.items():
+                    if app_key in writing_app:
+                        merged = name
+                        break
+            if merged:
+                label = merged
+                marketing = "__done__"
+        elif any(kw in make_lower for kw in ("xiaomi", "redmi", "poco")):
+            marketing = config.XIAOMI_MODEL_NAMES.get(model_lower)
+            if not marketing:
+                code = config._XIAOMI_NAME_TO_CODE.get(f"{make_lower} {model_lower}".strip())
+                if code:
+                    label = _sanitize_folder_name(f"{make} {model} {code}")
+                    marketing = "__done__"
+            if marketing != "__done__":
+                pass
+        elif "huawei" in make_lower:
+            marketing = config.HUAWEI_MODEL_NAMES.get(model_lower)
+        elif "samsung" in make_lower:
+            marketing = config.SAMSUNG_MODEL_NAMES.get(model_lower)
+
+        # 5. 构建标签
+        if marketing == "__done__":
+            pass
+        elif marketing and model:
+            if marketing.lower().startswith(make_lower):
+                label = _sanitize_folder_name(f"{marketing} {model}")
+            else:
+                label = _sanitize_folder_name(f"{make} {marketing} {model}")
+        elif make and model:
+            label = _sanitize_folder_name(f"{make} {model}")
+        else:
+            label = _sanitize_folder_name(make or model)
+
+    # 6. 源目录后缀（区分同型号不同手机）
+    for src_dir, suffix in config.SOURCE_DEVICE_SUFFIX.items():
+        if os.path.normcase(info.filepath).startswith(os.path.normcase(src_dir) + os.sep):
+            label = f"{label} ({suffix})"
+            break
+
+    return label
 
 
 _MIN_REASONABLE_YEAR = 1993
@@ -359,6 +416,12 @@ def copy_photo(
 # ── 三阶段并行处理（带设备过滤） ──
 
 
+def _is_screenshot(filepath: str) -> bool:
+    """通过文件名关键词判断是否为截图"""
+    filename = os.path.basename(filepath).lower()
+    return any(kw in filename for kw in config.SCREENSHOT_KEYWORDS)
+
+
 @dataclass
 class _PreparedItem:
     info: PhotoInfo
@@ -367,7 +430,10 @@ class _PreparedItem:
     file_hash: Optional[str] = None
     needs_copy: bool = True
     is_target: bool = True
+    is_screenshot: bool = False
+    is_dji: bool = False
     _file_mtime: float = 0.0
+    _file_ctime: float = 0.0
     nsfw_score: float = -1.0  # -1 表示未检测
 
 
@@ -420,6 +486,18 @@ def _prepare_one(
 
     device_type = classify_device(info)
 
+    # 截图检测（截图文件走独立目录，绕过设备过滤）
+    screenshot = _is_screenshot(info.filepath)
+
+    # DJI 检测（通过 make 或 writing_application 识别）
+    is_dji = "dji" in (info.make or "").lower()
+    if not is_dji:
+        writing_app = (info.extra.get("writing_application") or "").lower()
+        if writing_app.startswith("dji"):
+            is_dji = True
+            if not info.make:
+                info.make = "DJI"
+
     # 判断是否为目标设备（影响文件夹路由）
     if device_type == DeviceType.UNKNOWN:
         is_target = False
@@ -427,27 +505,29 @@ def _prepare_one(
         is_target = is_target_device(info, target_devices) if target_devices else True
 
     record = _make_record(info, device_type, is_target)
-    item = _PreparedItem(info=info, device_type=device_type, record=record, is_target=is_target)
+    item = _PreparedItem(info=info, device_type=device_type, record=record,
+                         is_target=is_target, is_screenshot=screenshot, is_dji=is_dji)
 
-    # ── 设备过滤 ──
-    if device_type == DeviceType.UNKNOWN:
-        should_copy_unknown = (
-            copy_unknown
-            or (copy_unknown_photo and info.media_type == "photo")
-            or (copy_unknown_video and info.media_type == "video")
-        )
-        if not should_copy_unknown:
-            if info.make:
+    # ── 设备过滤（截图和 DJI 不受设备过滤影响） ──
+    if not screenshot and not is_dji:
+        if device_type == DeviceType.UNKNOWN:
+            should_copy_unknown = (
+                copy_unknown
+                or (copy_unknown_photo and info.media_type == "photo")
+                or (copy_unknown_video and info.media_type == "video")
+            )
+            if not should_copy_unknown:
+                if info.make:
+                    record.status = "skipped_not_target"
+                else:
+                    record.status = "skipped_no_device"
+                item.needs_copy = False
+                return item
+        elif not copy_all:
+            if not is_target:
                 record.status = "skipped_not_target"
-            else:
-                record.status = "skipped_no_device"
-            item.needs_copy = False
-            return item
-    elif not copy_all:
-        if not is_target:
-            record.status = "skipped_not_target"
-            item.needs_copy = False
-            return item
+                item.needs_copy = False
+                return item
 
     # ── 小图过滤 ──
     if device_type == DeviceType.UNKNOWN and should_filter_small_image(info):
@@ -458,18 +538,27 @@ def _prepare_one(
     # ── 计算哈希（带源盘缓存，复用 PhotoInfo 已有的 size/mtime 避免额外 stat） ──
     try:
         file_mtime = info.file_modified.timestamp() if info.file_modified else None
+        try:
+            _st = os.stat(info.filepath)
+            file_ctime = _st.st_ctime
+            if file_mtime is None:
+                file_mtime = _st.st_mtime
+        except OSError:
+            file_ctime = 0.0
         if src_hash_entries and file_mtime is not None:
             cached = src_hash_entries.get(info.filepath)
             if (cached
-                    and abs(file_mtime - cached["mtime"]) < 0.01
+                    and _time_match(cached, file_mtime, file_ctime)
                     and info.file_size == cached["size"]):
                 item.file_hash = cached["hash"]
                 item._file_mtime = file_mtime
+                item._file_ctime = file_ctime
                 return item
         item.file_hash = _file_fast_hash(info.filepath, info.file_size)
         if file_mtime is None:
             file_mtime = os.stat(info.filepath).st_mtime
         item._file_mtime = file_mtime
+        item._file_ctime = file_ctime
     except Exception as e:
         record.status = "error"
         record.error_msg = f"计算哈希失败: {e}"
@@ -513,6 +602,11 @@ def _scan_dest_drive_for_reuse(dest_drive: str, max_workers: int = 8):
     dup_files: List[str] = []
     all_files: List[str] = []
 
+    def _is_album_dir(path: str) -> bool:
+        """判断文件是否在 All_相册 开头的目录下（旧整理输出，优先复用）"""
+        parts = os.path.normpath(path).split(os.sep)
+        return any(p.startswith("All_相册") for p in parts)
+
     logger.info(f"扫描目标盘 {dest_drive} 已有文件用于同盘复用...")
     for root, dirs, files in os.walk(dest_drive):
         dirs[:] = [d for d in dirs if d.lower() not in EXCLUDED_DIRS]
@@ -540,9 +634,12 @@ def _scan_dest_drive_for_reuse(dest_drive: str, max_workers: int = 8):
         if entry:
             try:
                 st = os.stat(fp)
-                if abs(st.st_mtime - entry["mtime"]) < 0.01 and st.st_size == entry["size"]:
+                if _time_match(entry, st.st_mtime, st.st_ctime) and st.st_size == entry["size"]:
                     h = entry["hash"]
                     if h not in hash_index:
+                        hash_index[h] = fp
+                    elif _is_album_dir(fp) and not _is_album_dir(hash_index[h]):
+                        dup_files.append(hash_index[h])
                         hash_index[h] = fp
                     else:
                         dup_files.append(fp)
@@ -579,9 +676,17 @@ def _scan_dest_drive_for_reuse(dest_drive: str, max_workers: int = 8):
                     if h:
                         if h not in hash_index:
                             hash_index[h] = fp
+                        elif _is_album_dir(fp) and not _is_album_dir(hash_index[h]):
+                            dup_files.append(hash_index[h])
+                            hash_index[h] = fp
                         else:
                             dup_files.append(fp)
-                        valid_entries[fp] = {"hash": h, "mtime": mtime, "size": size}
+                        e = {"hash": h, "mtime": mtime, "size": size}
+                        try:
+                            e["ctime"] = os.stat(fp).st_ctime
+                        except OSError:
+                            pass
+                        valid_entries[fp] = e
                     pbar.update(1)
             finally:
                 pool.shutdown(wait=False, cancel_futures=True)
@@ -664,10 +769,19 @@ def _do_copy(item: _PreparedItem, reuse_index: Optional[Dict[str, str]] = None) 
         with _reuse_lock:
             existing = reuse_index.pop(item.file_hash, None)
         if existing and _same_drive(existing, dest):
+            protected = any(
+                os.path.normcase(existing).startswith(os.path.normcase(d) + os.sep)
+                for d in config.REUSE_PROTECTED_DIRS
+            )
             try:
-                os.rename(existing, dest)
-                item.record.status = "ok"
-                _append_note(item.record, f"同盘移动自: {existing}")
+                if protected:
+                    shutil.copy2(existing, dest)
+                    item.record.status = "ok"
+                    _append_note(item.record, f"同盘复制自(保护目录): {existing}")
+                else:
+                    os.rename(existing, dest)
+                    item.record.status = "ok"
+                    _append_note(item.record, f"同盘移动自: {existing}")
                 reused = True
             except Exception:
                 reused = False
@@ -689,7 +803,7 @@ def _do_copy(item: _PreparedItem, reuse_index: Optional[Dict[str, str]] = None) 
 
 
 def _build_nsfw_dest(item: _PreparedItem) -> str:
-    """为 NSFW 文件构建目标路径: All_6_NSFW/{原始分类路径}，保留设备/时间目录结构"""
+    """为 NSFW 文件构建目标路径: All_7_NSFW/{原始分类路径}，保留设备/时间目录结构"""
     original_dest = item.record.destination
     output_root = config.REPORT_DIR
     try:
@@ -697,6 +811,42 @@ def _build_nsfw_dest(item: _PreparedItem) -> str:
     except ValueError:
         rel = os.path.basename(original_dest)
     return os.path.join(config.DEST_NSFW, rel)
+
+
+def _build_screenshot_dest(item: _PreparedItem) -> str:
+    """为截图文件构建目标路径: All_8_截图/{设备名/日期/文件名}，保留设备/时间目录结构"""
+    info = item.info
+    filename = os.path.basename(info.filepath)
+    device_type = item.device_type
+    effective_date, _ = _get_effective_date(info, device_type)
+
+    if device_type in (DeviceType.CAMERA, DeviceType.PHONE):
+        device_label = _build_device_label(info)
+        if effective_date:
+            date_folder = f"{effective_date.year}-{_quarter_label(effective_date.month)}"
+            return os.path.join(config.DEST_SCREENSHOT, device_label, date_folder, filename)
+        else:
+            return os.path.join(config.DEST_SCREENSHOT, device_label, config.NO_EXIF_DATE_FOLDER, filename)
+    else:
+        if effective_date:
+            date_folder = f"{effective_date.year}-{_quarter_label(effective_date.month)}"
+            return os.path.join(config.DEST_SCREENSHOT, date_folder, filename)
+        else:
+            return os.path.join(config.DEST_SCREENSHOT, config.NO_EXIF_DATE_FOLDER, filename)
+
+
+def _build_dji_dest_path(item: _PreparedItem) -> str:
+    """为 DJI 文件构建目标路径: All_3_DJI_大疆/{设备名}/{日期}/{文件名}"""
+    info = item.info
+    filename = os.path.basename(info.filepath)
+    device_label = _build_device_label(info)
+    effective_date, _ = _get_effective_date(info, item.device_type)
+
+    if effective_date:
+        date_folder = f"{effective_date.year}-{_quarter_label(effective_date.month)}"
+        return os.path.join(config.DEST_DJI, device_label, date_folder, filename)
+    else:
+        return os.path.join(config.DEST_DJI, device_label, config.NO_EXIF_DATE_FOLDER, filename)
 
 
 def _load_nsfw_cache(cache_path: str) -> dict:
@@ -930,7 +1080,7 @@ def copy_photos_parallel(
     """
     total = len(photo_infos)
 
-    # ── 加载源盘哈希缓存 ──
+    # ── 加载源盘哈希缓存（含目标盘备份兜底） ──
     src_hash_entries: Dict[str, dict] = {}
     src_cache_paths: Dict[str, str] = {}
     paths_by_drive: Dict[str, list] = {}
@@ -938,6 +1088,14 @@ def copy_photos_parallel(
         drv = os.path.splitdrive(info.filepath)[0].upper()
         if drv:
             paths_by_drive.setdefault(drv, []).append(os.path.dirname(info.filepath))
+
+    # 加载目标盘备份的源哈希缓存
+    backup_dir = _get_backup_cache_dir()
+    backup_src_path = os.path.join(backup_dir, SRC_HASH_CACHE_FILENAME) if backup_dir else None
+    backup_src_entries = _load_hash_cache(backup_src_path) if backup_src_path else {}
+    if backup_src_entries:
+        logger.info(f"目标盘源哈希备份缓存: {len(backup_src_entries)} 条")
+
     for drv, hint_paths in paths_by_drive.items():
         cache_dir = None
         root_dir = os.path.join(drv + os.sep, CACHE_DIR)
@@ -953,12 +1111,21 @@ def copy_photos_parallel(
                     break
                 except OSError:
                     continue
+        if cache_dir:
+            cp = os.path.join(cache_dir, SRC_HASH_CACHE_FILENAME)
+            src_cache_paths[drv] = cp
+            src_hash_entries.update(_load_hash_cache(cp))
+
+        # 从备份缓存补充该盘未命中的条目
+        if backup_src_entries:
+            drv_prefix = drv.upper()
+            for k, v in backup_src_entries.items():
+                if os.path.splitdrive(k)[0].upper() == drv_prefix and k not in src_hash_entries:
+                    src_hash_entries[k] = v
+
         if not cache_dir:
             logger.debug(f"无法创建缓存目录 {drv}\\{CACHE_DIR}，跳过该盘哈希缓存")
-            continue
-        cp = os.path.join(cache_dir, SRC_HASH_CACHE_FILENAME)
-        src_cache_paths[drv] = cp
-        src_hash_entries.update(_load_hash_cache(cp))
+
     if src_hash_entries:
         logger.info(f"已加载源盘哈希缓存: {len(src_hash_entries)} 条")
 
@@ -998,7 +1165,8 @@ def copy_photos_parallel(
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
 
-    # ── 保存源盘哈希缓存 ──
+    # ── 保存源盘哈希缓存 + 同步到目标盘备份 ──
+    all_src_entries: Dict[str, dict] = {}
     valid_by_drive: Dict[str, Dict[str, dict]] = {drv: {} for drv in paths_by_drive}
     for item in items:
         if item and item.file_hash and item._file_mtime:
@@ -1006,16 +1174,31 @@ def copy_photos_parallel(
             drv = os.path.splitdrive(fp)[0].upper()
             cached = src_hash_entries.get(fp)
             if cached and cached["hash"] == item.file_hash:
+                if "ctime" not in cached and item._file_ctime:
+                    cached["ctime"] = item._file_ctime
                 valid_by_drive[drv][fp] = cached
             else:
-                valid_by_drive[drv][fp] = {
+                entry = {
                     "hash": item.file_hash,
                     "mtime": item._file_mtime,
                     "size": item.info.file_size,
                 }
+                if item._file_ctime:
+                    entry["ctime"] = item._file_ctime
+                valid_by_drive[drv][fp] = entry
     for drv, entries in valid_by_drive.items():
         if entries and drv in src_cache_paths:
             _save_hash_cache(src_cache_paths[drv], entries)
+        all_src_entries.update(entries)
+
+    # 同步到目标盘备份
+    if backup_src_path and all_src_entries:
+        merged = dict(backup_src_entries)
+        merged.update(all_src_entries)
+        _save_hash_cache(backup_src_path, merged)
+        new_count = len(merged) - len(backup_src_entries)
+        if new_count > 0:
+            logger.info(f"源哈希备份缓存同步: +{new_count} 条, 总计 {len(merged)} 条")
 
     # 填充未完成的条目（中断时部分 items 可能仍为 None）
     for i, item in enumerate(items):
@@ -1033,6 +1216,49 @@ def copy_photos_parallel(
                 ),
                 needs_copy=False,
             )
+
+    # ── 阶段 1.2：DJI 同文件夹推断（未识别文件继承同目录下 DJI 设备标签） ──
+    if not is_interrupted():
+        dji_folder_map: Dict[str, str] = {}  # {源目录: DJI设备标签}
+        for item in items:
+            if item and item.is_dji and item.info.make:
+                src_dir = os.path.dirname(item.info.filepath)
+                if src_dir not in dji_folder_map:
+                    dji_folder_map[src_dir] = _build_device_label(item.info)
+
+        if dji_folder_map:
+            inferred_count = 0
+            need_hash: List[_PreparedItem] = []
+            for item in items:
+                if item is None or item.is_dji or item.is_screenshot:
+                    continue
+                if not item.needs_copy and item.record.status in ("skipped_no_device", "skipped_not_target"):
+                    src_dir = os.path.dirname(item.info.filepath)
+                    dji_label = dji_folder_map.get(src_dir)
+                    if dji_label:
+                        item.is_dji = True
+                        item.needs_copy = True
+                        item.record.status = ""
+                        if not item.info.make:
+                            item.info.make = "DJI"
+                        inferred_count += 1
+                        if not item.file_hash:
+                            need_hash.append(item)
+
+            if need_hash:
+                for item in need_hash:
+                    try:
+                        item.file_hash = _file_fast_hash(item.info.filepath, item.info.file_size)
+                        _st = os.stat(item.info.filepath)
+                        item._file_mtime = _st.st_mtime
+                        item._file_ctime = _st.st_ctime
+                    except Exception as e:
+                        item.record.status = "error"
+                        item.record.error_msg = f"DJI推断补算哈希失败: {e}"
+                        item.needs_copy = False
+
+            if inferred_count:
+                logger.info(f"DJI 同文件夹推断: {inferred_count} 个未识别文件继承 DJI 设备标签")
 
     # ── 阶段 1.5：NSFW batch 检测（GPU 加速） ──
     if nsfw_detector and not is_interrupted():
@@ -1064,6 +1290,7 @@ def copy_photos_parallel(
 
     assigned_dests: Set[str] = set()  # 本批次已分配的目标路径（normcase）
     to_copy: List[_PreparedItem] = []
+    dji_accepted: List[_PreparedItem] = []  # 通过去重的 DJI 项（含 dry_run）
 
     nsfw_prefix = (os.path.normcase(config.DEST_NSFW) + os.sep) if config.DEST_NSFW else ""
 
@@ -1073,6 +1300,14 @@ def copy_photos_parallel(
 
         item.record.file_hash = item.file_hash
 
+        # 截图路由：截图文件重定向到截图目录
+        if item.is_screenshot and config.DEST_SCREENSHOT:
+            item.record.destination = _build_screenshot_dest(item)
+
+        # DJI 路由：DJI 文件重定向到 DJI 专属目录
+        if item.is_dji and config.DEST_DJI:
+            item.record.destination = _build_dji_dest_path(item)
+
         # NSFW 路由优先于去重：先确定目标路径
         is_nsfw = (nsfw_detector and item.nsfw_score >= nsfw_detector.threshold and config.DEST_NSFW)
         if is_nsfw:
@@ -1080,7 +1315,7 @@ def copy_photos_parallel(
 
         if item.file_hash in seen_hashes:
             existing = seen_hashes[item.file_hash]
-            # NSFW 文件：仅当 All_6_NSFW 内已有同哈希文件时才跳过
+            # NSFW 文件：仅当 All_7_NSFW 内已有同哈希文件时才跳过
             if is_nsfw and nsfw_prefix and not os.path.normcase(existing).startswith(nsfw_prefix):
                 pass  # 原位置已有但 NSFW 目录没有，仍需复制
             else:
@@ -1096,12 +1331,73 @@ def copy_photos_parallel(
         item.record.destination = resolved
         assigned_dests.add(os.path.normcase(resolved))
 
+        if item.is_dji:
+            dji_accepted.append(item)
+
         if dry_run:
             item.record.status = "dry_run"
             item.needs_copy = False
             continue
 
         to_copy.append(item)
+
+    # ── 阶段 2.5：DJI 伴随文件发现（.SRT 等非媒体同名文件随行复制） ──
+    companion_items: List[_PreparedItem] = []
+    seen_companions: Set[str] = set()
+    for item in dji_accepted:
+        src_path = item.info.filepath
+        stem = os.path.splitext(os.path.basename(src_path))[0]
+        src_dir = os.path.dirname(src_path)
+        dest_dir = os.path.dirname(item.record.destination)
+        try:
+            for fname in os.listdir(src_dir):
+                if os.path.splitext(fname)[0] != stem:
+                    continue
+                ext = os.path.splitext(fname)[1].lower()
+                if ext in config.MEDIA_EXTENSIONS:
+                    continue
+                comp_src = os.path.join(src_dir, fname)
+                if not os.path.isfile(comp_src):
+                    continue
+                nc = os.path.normcase(comp_src)
+                if nc in seen_companions:
+                    continue
+                seen_companions.add(nc)
+                comp_dest = os.path.join(dest_dir, fname)
+                comp_dest = _resolve_conflict(comp_dest, assigned_dests)
+                assigned_dests.add(os.path.normcase(comp_dest))
+                try:
+                    comp_stat = os.stat(comp_src)
+                    comp_size = comp_stat.st_size
+                    comp_mtime = datetime.fromtimestamp(comp_stat.st_mtime)
+                except OSError:
+                    comp_size = 0
+                    comp_mtime = None
+                comp_info = PhotoInfo(
+                    filepath=comp_src, media_type="companion",
+                    file_size=comp_size, file_modified=comp_mtime,
+                )
+                comp_record = CopyRecord(
+                    source=comp_src, destination=comp_dest,
+                    device_type="dji_companion", media_type="companion",
+                    make=item.info.make or "DJI", model=item.info.model or "",
+                    date_taken="", has_exif_date=False,
+                    file_size=comp_size, status="",
+                )
+                comp_item = _PreparedItem(
+                    info=comp_info, device_type=item.device_type,
+                    record=comp_record, is_dji=True,
+                )
+                if dry_run:
+                    comp_record.status = "dry_run"
+                    comp_item.needs_copy = False
+                companion_items.append(comp_item)
+        except OSError:
+            pass
+
+    if companion_items:
+        logger.info(f"DJI 伴随文件: {len(companion_items)} 个（.SRT 等随行复制）")
+        to_copy.extend([c for c in companion_items if c.needs_copy])
 
     # ── 阶段 3：并行复制 ──
     if to_copy:
@@ -1177,10 +1473,19 @@ def copy_photos_parallel(
             logger.info(", ".join(parts))
 
     # 删除目标盘上的重复文件（同哈希多余副本，无论是否有新文件要复制）
+    # 保护目录中的文件不删除
     if dup_files:
+        protected_prefixes = [
+            os.path.normcase(d) + os.sep for d in config.REUSE_PROTECTED_DIRS
+        ]
         dup_deleted = 0
+        dup_skipped = 0
         dup_bytes = 0
         for fp in dup_files:
+            norm_fp = os.path.normcase(fp)
+            if any(norm_fp.startswith(p) for p in protected_prefixes):
+                dup_skipped += 1
+                continue
             try:
                 if os.path.isfile(fp):
                     sz = os.path.getsize(fp)
@@ -1192,11 +1497,15 @@ def copy_photos_parallel(
         if dup_deleted:
             logger.info(f"删除目标盘重复文件: {dup_deleted} 个, "
                          f"释放 {_human_size(dup_bytes)}")
+        if dup_skipped:
+            logger.info(f"保护目录重复文件跳过: {dup_skipped} 个（不删除）")
 
     # ── 汇总结果 ──
     nsfw_root = os.path.normcase(config.DEST_NSFW + os.sep) if config.DEST_NSFW else ""
     result = OrganizeResult(total_found=total)
     result.records = [item.record for item in items]
+    if companion_items:
+        result.records.extend(c.record for c in companion_items)
     for record in result.records:
         if record.status in ("ok", "dry_run"):
             result.copied += 1
@@ -1222,6 +1531,8 @@ def copy_photos_parallel(
     dest_roots = {config.DEST_CAMERA, config.DEST_PHONE, config.DEST_UNKNOWN}
     if config.DEST_NSFW:
         dest_roots.add(config.DEST_NSFW)
+    if config.DEST_SCREENSHOT:
+        dest_roots.add(config.DEST_SCREENSHOT)
     if config.DEST_CAMERA_OTHER:
         dest_roots.update({config.DEST_CAMERA_OTHER, config.DEST_PHONE_OTHER})
     _backfill_filelists(dest_roots)

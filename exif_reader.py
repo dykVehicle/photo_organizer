@@ -340,6 +340,10 @@ def _read_video_ffprobe(filepath: str) -> dict:
         or tags.get("date", "")
     )
 
+    writing_app = tags.get("encoder", "") or tags.get("writing_application", "")
+    if writing_app:
+        result["writing_application"] = writing_app
+
     width = None
     height = None
     for stream in data.get("streams", []):
@@ -397,7 +401,7 @@ def _parse_mp4_boxes(f, end_pos: int, result: dict, depth: int = 0):
 
         if box_type == b"mvhd":
             _parse_mvhd(f, box_end, result)
-        elif box_type in (b"\xa9mak", b"\xa9mod", b"\xa9day"):
+        elif box_type in (b"\xa9mak", b"\xa9mod", b"\xa9day", b"\xa9too"):
             _parse_udta_text(f, box_type, box_end, result)
         elif box_type in container_types:
             inner_start = f.tell()
@@ -462,7 +466,10 @@ def _parse_udta_text(f, box_type: bytes, box_end: int, result: dict):
             pass
 
     if text:
-        key_map = {b"\xa9mak": "make", b"\xa9mod": "model", b"\xa9day": "creation_time"}
+        key_map = {
+            b"\xa9mak": "make", b"\xa9mod": "model",
+            b"\xa9day": "creation_time", b"\xa9too": "writing_application",
+        }
         key = key_map.get(box_type)
         if key and key not in result:
             result[key] = text
@@ -471,17 +478,17 @@ def _parse_udta_text(f, box_type: bytes, box_end: int, result: dict):
 def _read_video_metadata(filepath: str) -> dict:
     """
     读取视频元数据，优先 ffprobe → 回退内置 MP4 解析器。
-    返回 dict: {make, model, creation_time, width, height}
+    返回 dict: {make, model, creation_time, width, height, writing_application}
     """
     meta = _read_video_ffprobe(filepath)
-    if meta.get("creation_time") or meta.get("make"):
-        return meta
+    ffprobe_ok = bool(meta.get("creation_time") or meta.get("make"))
 
-    mp4_meta = _read_mp4_box_metadata(filepath)
-    if mp4_meta:
-        for k, v in mp4_meta.items():
-            if v and not meta.get(k):
-                meta[k] = v
+    if not ffprobe_ok or not meta.get("writing_application"):
+        mp4_meta = _read_mp4_box_metadata(filepath)
+        if mp4_meta:
+            for k, v in mp4_meta.items():
+                if v and not meta.get(k):
+                    meta[k] = v
 
     return meta
 
@@ -522,6 +529,10 @@ def read_photo_info(filepath: str) -> PhotoInfo:
             info.height = int(meta.get("height", 0))
         except (ValueError, TypeError):
             pass
+
+        wa = meta.get("writing_application", "")
+        if wa:
+            info.extra["writing_application"] = wa
 
         return info
 
@@ -687,6 +698,21 @@ def _meta_cache_path_for_drive(drive: str, hint_paths: Optional[list] = None) ->
     return os.path.join(cache_dir, _META_CACHE_FILENAME)
 
 
+def _time_match(entry: dict, mtime: float, ctime: float = 0.0) -> bool:
+    """缓存时间戳匹配：当前文件的 mtime/ctime 任一与缓存中任一匹配即命中"""
+    tol = 0.01
+    cached_mtime = entry.get("mtime", 0.0)
+    cached_ctime = entry.get("ctime", 0.0)
+    candidates = [t for t in (cached_mtime, cached_ctime) if t > 0]
+    for cur in (mtime, ctime):
+        if cur <= 0:
+            continue
+        for ref in candidates:
+            if abs(cur - ref) < tol:
+                return True
+    return False
+
+
 def _load_meta_cache(cache_path: str) -> Dict[str, dict]:
     """加载元数据缓存，返回 {filepath: {mtime, size, info_dict}} """
     try:
@@ -719,6 +745,18 @@ def _save_meta_cache(cache_path: str, entries: Dict[str, dict]) -> None:
             pass
 
 
+def _get_backup_cache_dir() -> Optional[str]:
+    """获取目标盘上的统一备份缓存目录（由 config.REPORT_DIR 或 config.DEST_CAMERA 推算）"""
+    import config as _cfg
+    ref = getattr(_cfg, "REPORT_DIR", "") or getattr(_cfg, "DEST_CAMERA", "")
+    if not ref:
+        return None
+    drv = os.path.splitdrive(ref)[0]
+    if not drv:
+        return None
+    return _try_make_cache_dir(drv + os.sep, _CACHE_DIR)
+
+
 def read_photo_infos_parallel(
     filepaths: List[str],
     max_workers: int = 8,
@@ -738,13 +776,28 @@ def read_photo_infos_parallel(
             drive_indices.setdefault(drv, []).append(i)
             drive_dirs.setdefault(drv, []).append(os.path.dirname(fp))
 
+    # ── 加载目标盘备份缓存（所有源盘的元数据统一备份） ──
+    backup_dir = _get_backup_cache_dir()
+    backup_path = os.path.join(backup_dir, _META_CACHE_FILENAME) if backup_dir else None
+    backup_cache = _load_meta_cache(backup_path) if backup_path else {}
+    if backup_cache:
+        logger.info(f"目标盘元数据备份缓存: {len(backup_cache)} 条")
+
     total_cache_hits = 0
+    all_valid_entries: Dict[str, dict] = {}
 
     # ── 逐盘处理：加载缓存 → 读取 → 保存缓存 ──
     for drv, indices in drive_indices.items():
         unique_hints = sorted(set(drive_dirs[drv]), key=len)[:5]
         cache_path = _meta_cache_path_for_drive(drv, unique_hints)
         cached = _load_meta_cache(cache_path) if cache_path else {}
+
+        # 合并备份缓存（源盘缓存优先，备份兜底）
+        if backup_cache:
+            drv_prefix = drv.upper()
+            for k, v in backup_cache.items():
+                if os.path.splitdrive(k)[0].upper() == drv_prefix and k not in cached:
+                    cached[k] = v
 
         to_read: List[int] = []
         cache_hits = 0
@@ -754,7 +807,7 @@ def read_photo_infos_parallel(
             if entry:
                 try:
                     st = os.stat(fp)
-                    if abs(st.st_mtime - entry["mtime"]) < 0.01 and st.st_size == entry["size"]:
+                    if _time_match(entry, st.st_mtime, st.st_ctime) and st.st_size == entry["size"]:
                         results[i] = _dict_to_photo_info(fp, entry["info"])
                         cache_hits += 1
                         if progress_callback:
@@ -783,6 +836,7 @@ def read_photo_infos_parallel(
                         st = os.stat(fp)
                         new_entries[fp] = {
                             "mtime": st.st_mtime,
+                            "ctime": st.st_ctime,
                             "size": st.st_size,
                             "info": _photo_info_to_dict(info),
                         }
@@ -803,6 +857,23 @@ def read_photo_infos_parallel(
                     valid_entries[fp] = entry
             if valid_entries:
                 _save_meta_cache(cache_path, valid_entries)
+                all_valid_entries.update(valid_entries)
+        else:
+            # 源盘无法写缓存时仍收集条目用于备份
+            for i in indices:
+                fp = filepaths[i]
+                entry = new_entries.get(fp) or cached.get(fp)
+                if entry:
+                    all_valid_entries[fp] = entry
+
+    # ── 将所有源盘缓存同步到目标盘备份 ──
+    if backup_path and all_valid_entries:
+        merged = dict(backup_cache)
+        merged.update(all_valid_entries)
+        _save_meta_cache(backup_path, merged)
+        new_count = len(merged) - len(backup_cache)
+        if new_count > 0:
+            logger.info(f"元数据备份缓存同步: +{new_count} 条, 总计 {len(merged)} 条 → {backup_path}")
 
     if total_cache_hits:
         logger.info(f"元数据缓存命中 {total_cache_hits}/{len(filepaths)} 个文件，"

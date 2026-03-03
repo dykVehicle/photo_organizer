@@ -11,6 +11,7 @@ from config import (
     SONY_PHONE_MODEL_KEYWORDS,
     DEFAULT_TARGET_BRANDS,
     DEFAULT_TARGET_MODELS,
+    EXCLUDED_TARGET_MODELS,
 )
 from exif_reader import PhotoInfo
 
@@ -86,12 +87,16 @@ def is_target_device(info: PhotoInfo, target_brands: Optional[Set[str]] = None) 
     if not make_lower:
         return False
 
+    model_lower = info.model.lower().strip() if info.model else ""
+
+    if model_lower in EXCLUDED_TARGET_MODELS:
+        return False
+
     brands = target_brands if target_brands is not None else DEFAULT_TARGET_BRANDS
     for keyword in brands:
         if keyword in make_lower:
             return True
 
-    model_lower = info.model.lower().strip() if info.model else ""
     device_str = f"{make_lower} {model_lower}".strip()
     for target_model in DEFAULT_TARGET_MODELS:
         if target_model in device_str:

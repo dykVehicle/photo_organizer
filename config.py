@@ -11,23 +11,28 @@ DEFAULT_WORKERS = 32
 DEST_DRIVE = "H:\\"
 DEST_PHONE_NAME = "All_1_手机照片"
 DEST_CAMERA_NAME = "All_2_相机照片"
-DEST_UNKNOWN_NAME = "All_3_未识别设备照片"
+DEST_DJI_NAME = "All_3_DJI_大疆"
+DEST_UNKNOWN_NAME = "All_4_未识别设备照片"
 
 # --copy-all 模式下的命名（目标设备 / 其他设备）
 DEST_TARGET_PHONE_NAME = "All_1_目标设备_手机照片"
 DEST_TARGET_CAMERA_NAME = "All_2_目标设备_相机照片"
-DEST_OTHER_PHONE_NAME = "All_3_其他设备_手机照片"
-DEST_OTHER_CAMERA_NAME = "All_4_其他设备_相机照片"
-DEST_OTHER_UNKNOWN_NAME = "All_5_其他设备_未识别设备照片"
-DEST_NSFW_NAME = "All_6_NSFW"
+DEST_DJI_COPYALL_NAME = "All_3_DJI_大疆"
+DEST_OTHER_PHONE_NAME = "All_4_其他设备_手机照片"
+DEST_OTHER_CAMERA_NAME = "All_5_其他设备_相机照片"
+DEST_OTHER_UNKNOWN_NAME = "All_6_其他设备_未识别设备照片"
+DEST_NSFW_NAME = "All_7_NSFW"
+DEST_SCREENSHOT_NAME = "All_8_截图"
 
 # 运行时由 main.py 设置的完整路径（不要手动修改）
 DEST_CAMERA = ""
 DEST_PHONE = ""
+DEST_DJI = ""
 DEST_UNKNOWN = ""
 DEST_CAMERA_OTHER = ""
 DEST_PHONE_OTHER = ""
 DEST_NSFW = ""
+DEST_SCREENSHOT = ""
 REPORT_DIR = ""
 
 NO_EXIF_DATE_FOLDER = "未知日期_无EXIF"
@@ -68,6 +73,17 @@ EXCLUDED_DIRS = {
 
 # ── 排除的盘符（目标盘，避免重复扫描） ──
 EXCLUDED_DRIVES = set()
+
+# ── 同盘复用保护目录（只读：可从中复制，但不会移动或删除其中的文件） ──
+REUSE_PROTECTED_DIRS = {
+    r"H:\相册备份_20260301",
+    r"H:\相册源文件\小米14 wz",
+}
+
+# ── 源目录 → 设备标签后缀（区分同型号不同手机） ──
+SOURCE_DEVICE_SUFFIX = {
+    r"H:\相册源文件\小米14 wz": "wz",
+}
 
 
 def get_all_drives():
@@ -374,6 +390,19 @@ DEFAULT_TARGET_BRANDS = {
     "dji",
 }
 
+# 从目标设备中排除的特定型号（model 小写匹配）
+# 即使品牌命中 DEFAULT_TARGET_BRANDS，这些型号仍归入"其他设备"
+EXCLUDED_TARGET_MODELS = {
+    "iphone",       # Apple iPhone (无具体型号)
+    "iphone 8",     # Apple iPhone 8
+    "mt7-cl00",     # HUAWEI Mate 7
+    "tit-cl10",     # HUAWEI Enjoy 5
+    "dig-al00",     # HUAWEI Enjoy 6S
+    "bln-al40",     # HUAWEI Honor 6X
+    "nx10",         # Samsung NX10
+    "x6d",          # vivo X6D
+}
+
 # 型号级匹配：make+model 组合精确匹配（小写比较）
 # 格式: "品牌 型号" 或 "品牌_型号"，匹配时用 (make + " " + model).lower() 包含检查
 DEFAULT_TARGET_MODELS = {
@@ -414,5 +443,28 @@ DEFAULT_TARGET_MODELS = {
 
 # 合并用于向后兼容（--devices 命令行参数仍按品牌匹配）
 DEFAULT_TARGET_DEVICES = DEFAULT_TARGET_BRANDS
+
+# ── DJI 大疆设备名合并映射 ──
+# EXIF model（小写）→ 统一设备文件夹名
+DJI_MODEL_NAMES = {
+    "fc8582": "DJI_FLIP_FC8582",
+    "ac004": "DJI_OsmoAction5_Pro_AC004",
+}
+
+# 视频 Writing application（小写关键词）→ 统一设备文件夹名
+DJI_APP_NAMES = {
+    "dji flip": "DJI_FLIP_FC8582",
+    "dji osmoaction5 pro": "DJI_OsmoAction5_Pro_AC004",
+}
+
+# ── 截图文件名关键词（小写匹配，文件名包含任一即判定为截图） ──
+SCREENSHOT_KEYWORDS = {
+    "screenshot",
+    "screen_shot",
+    "screen-shot",
+    "screen shot",
+    "截图",
+    "截屏",
+}
 
 COPY_UNKNOWN = False

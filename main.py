@@ -122,7 +122,9 @@ def _init_dest_paths(args) -> str:
         config.DEST_CAMERA_OTHER = ""
         config.DEST_PHONE_OTHER = ""
 
+    config.DEST_DJI = os.path.join(root, config.DEST_DJI_NAME)
     config.DEST_NSFW = os.path.join(root, config.DEST_NSFW_NAME)
+    config.DEST_SCREENSHOT = os.path.join(root, config.DEST_SCREENSHOT_NAME)
     config.REPORT_DIR = args.report_dir or root
     return root
 
