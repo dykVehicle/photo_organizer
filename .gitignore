@@ -10,6 +10,6 @@ build/
 .cursor/
 
 # 临时/调试脚本
-_*.py
+# _*.py
 
 # 模型二进制文件通过 Git LFS 管理（见 .gitattributes）

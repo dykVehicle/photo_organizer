@@ -23,6 +23,7 @@ DEST_OTHER_CAMERA_NAME = "All_5_其他设备_相机照片"
 DEST_OTHER_UNKNOWN_NAME = "All_6_其他设备_未识别设备照片"
 DEST_NSFW_NAME = "All_7_NSFW"
 DEST_SCREENSHOT_NAME = "All_8_截图"
+DEST_FACE_ALBUM_NAME = "All_F_人物相册"
 
 # 运行时由 main.py 设置的完整路径（不要手动修改）
 DEST_CAMERA = ""
@@ -33,6 +34,7 @@ DEST_CAMERA_OTHER = ""
 DEST_PHONE_OTHER = ""
 DEST_NSFW = ""
 DEST_SCREENSHOT = ""
+DEST_FACE_ALBUM = ""
 REPORT_DIR = ""
 
 NO_EXIF_DATE_FOLDER = "未知日期_无EXIF"

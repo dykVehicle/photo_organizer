@@ -96,6 +96,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--nsfw-threshold", type=float, default=0.5,
                    help="NSFW 检测阈值 0.0~1.0（默认 0.5），概率超过此值判定为 NSFW")
 
+    p.add_argument("--face", action="store_true", default=False,
+                   help="启用人脸识别聚类，生成人物相册硬链接（默认关闭）")
+    p.add_argument("--no-face", action="store_false", dest="face",
+                   help="禁用人脸识别")
+    p.add_argument("--face-min-cluster", type=int, default=2,
+                   help="人脸聚类最小样本数（默认 2，至少出现 2 张照片才建人物文件夹）")
+    p.add_argument("--face-cache-only", action="store_true", default=False,
+                   help="仅执行人脸检测+嵌入提取并写入缓存，不聚类和创建相册")
+
     return p.parse_args()
 
 
@@ -125,6 +134,7 @@ def _init_dest_paths(args) -> str:
     config.DEST_DJI = os.path.join(root, config.DEST_DJI_NAME)
     config.DEST_NSFW = os.path.join(root, config.DEST_NSFW_NAME)
     config.DEST_SCREENSHOT = os.path.join(root, config.DEST_SCREENSHOT_NAME)
+    config.DEST_FACE_ALBUM = os.path.join(root, config.DEST_FACE_ALBUM_NAME)
     config.REPORT_DIR = args.report_dir or root
     return root
 
@@ -378,10 +388,48 @@ def main() -> None:
         logger.warning("")
         logger.warning("用户中断 (Ctrl+C)，正在生成已完成部分的报告...")
 
-    # ── 阶段 4：生成报告（正常完成 或 中断后均执行） ──
+    # ── 阶段 4：人脸识别聚类（仅 --face 时） ──
+    if args.face and result and not interrupted:
+        phase_label = "阶段 4: 人脸识别聚类"
+        logger.info("=" * 60)
+        logger.info(phase_label)
+        logger.info("=" * 60)
+
+        try:
+            from face_detector import check_dependencies as face_check, FaceAnalyzer
+            face_check()
+
+            dest_drive = os.path.splitdrive(config.DEST_CAMERA or config.REPORT_DIR)[0]
+            cache_dir = os.path.join(dest_drive + os.sep, ".photo_organizer") if dest_drive else ""
+
+            analyzer = FaceAnalyzer()
+            face_result = analyzer.run_pipeline(
+                records=result.records,
+                dest_dir=config.DEST_FACE_ALBUM,
+                cache_dir=cache_dir,
+                max_workers=workers,
+                skip_nsfw_dir=config.DEST_NSFW,
+                min_cluster_size=args.face_min_cluster,
+                dry_run=args.dry_run,
+                cache_only=args.face_cache_only,
+            )
+            if args.face_cache_only:
+                logger.info("人脸识别 (cache_only): %d 张人脸已缓存", face_result.total_faces)
+            else:
+                logger.info("人脸识别: %d 张人脸, %d 个人物, %d 个硬链接, %d 个离群",
+                            face_result.total_faces, face_result.total_persons,
+                            face_result.total_links, face_result.outlier_faces)
+        except ImportError as e:
+            logger.warning("人脸识别依赖未安装，已跳过: %s", e)
+        except Exception as e:
+            logger.error("人脸识别异常: %s", e, exc_info=True)
+
+    # ── 阶段 5：生成报告（正常完成 或 中断后均执行） ──
     if result is not None or photo_infos:
         logger.info("=" * 60)
-        logger.info("阶段 4/4: 生成整理报告%s", "（部分数据）" if interrupted else "")
+        logger.info("阶段 %s: 生成整理报告%s",
+                     "5/5" if args.face else "4/4",
+                     "（部分数据）" if interrupted else "")
         logger.info("=" * 60)
 
         if result is None:

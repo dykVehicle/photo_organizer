@@ -110,6 +110,57 @@ MVI_0003.MP4  | 2024-01-15 10:32:00 | 156.7MB | Canon EOS R5 |                  
 - 检出文件隔离到 `All_7_NSFW` 目录
 - 默认开启，依赖未安装时自动跳过；可用 `--no-nsfw` 手动关闭
 
+## 人脸识别聚类（--face）
+
+可选功能，通过 `--face` 启用。在文件复制完成后（Phase 4），对目标盘图片执行人脸检测、嵌入提取和密度聚类，按人物创建 NTFS 硬链接文件夹 `All_F_人物相册`，**零额外磁盘空间**。
+
+### 技术方案
+
+| 阶段 | 技术 | 说明 |
+|---|---|---|
+| 人脸检测+嵌入 | InsightFace buffalo_l (ONNX) | 512-D ArcFace 嵌入，GPU/CPU 自动回退 |
+| 聚类 | HDBSCAN | 密度聚类，自动确定人物数量，无需预设 K 值 |
+| 相册创建 | NTFS 硬链接 | 同一文件多个入口，不占额外磁盘空间 |
+
+### 输出目录
+
+```
+All_相册_xxx/
+├── All_F_人物相册/
+│   ├── 人物_001/
+│   │   ├── IMG_001.jpg    → 硬链接到 All_1_.../IMG_001.jpg
+│   │   └── IMG_002.jpg    → 硬链接到 All_2_.../IMG_002.jpg
+│   ├── 人物_002/
+│   │   └── ...
+│   └── face_index.json    ← 元数据索引
+```
+
+### 分阶段缓存
+
+缓存存放在盘符根目录 `H:\.photo_organizer\`，不依赖文件路径，输出目录改名后仍可命中：
+
+- **Stage 1**: `face_embedding_cache.json` — 人脸嵌入向量（最耗时，优先缓存）
+- **Stage 2**: `face_clustering_cache.json` — 聚类结果（输入集合不变时直接复用）
+
+### 使用方法
+
+```bash
+# 整理 + 人脸识别（完整流程）
+python main.py --face --copy-all --scan-dirs "H:\相册源文件\"
+
+# 仅缓存嵌入，不聚类不创建相册（预热缓存用）
+python main.py --face --face-cache-only --copy-all --scan-dirs "H:\相册源文件\"
+
+# 调整聚类最小样本数（默认 2，增大可减少小簇）
+python main.py --face --face-min-cluster 3 --copy-all --scan-dirs "H:\相册源文件\"
+```
+
+### 额外依赖
+
+```bash
+pip install insightface onnxruntime-gpu scikit-learn opencv-python-headless
+```
+
 ## 安装
 
 ```bash
@@ -226,6 +277,9 @@ python main.py --no-nsfw --scan-dirs "G:\相册_G" --output-dir "H:\All_相册"
 | `--copy-unknown-video` | False | 仅复制未识别的视频 |
 | `--nsfw` / `--no-nsfw` | True | NSFW 两阶段检测（默认开启，依赖缺失自动跳过；`--no-nsfw` 关闭） |
 | `--nsfw-threshold` | 0.5 | NudeNet 精检最终阈值（0.0~1.0） |
+| `--face` / `--no-face` | False | 人脸识别聚类（默认关闭；`--face` 开启） |
+| `--face-min-cluster` | 2 | 人脸聚类最小样本数（至少出现 N 张照片才建人物文件夹） |
+| `--face-cache-only` | False | 仅检测+缓存嵌入，不聚类不创建相册 |
 | `--no-exclude` | False | 禁用目录排除规则 |
 | `--include-hidden` | False | 扫描隐藏目录 |
 | `--dry-run` | False | 试运行，不实际复制 |
