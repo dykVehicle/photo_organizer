@@ -1,4 +1,7 @@
-"""全量文档检测扫描: 扫描已整理目录，缓存检测结果，并将文档图片复制到 All_7_文档图片"""
+"""全量文档检测扫描: 扫描已整理目录，缓存检测结果，并将文档图片硬链接到 All_7_文档图片
+
+使用双模型集成 (docornot + doctype) 条件融合检测。
+"""
 import json
 import logging
 import os
@@ -21,7 +24,7 @@ from tqdm import tqdm
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("scan_doc")
 
-SOURCE_DIR = r"H:\All_相册_20260305"
+SOURCE_DIR = r"H:\All_相册_20260307"
 CACHE_DIR = r"H:\.photo_organizer"
 DOC_OUTPUT_DIR = os.path.join(SOURCE_DIR, "All_7_文档图片")
 SCREENSHOT_OUTPUT_DIR = os.path.join(DOC_OUTPUT_DIR, "截图")
@@ -33,8 +36,10 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".heic", ".heif"
 RAW_EXTS = {".cr2", ".cr3", ".nef", ".arw", ".orf", ".rw2", ".dng", ".raf", ".pef", ".srw"}
 SCREENSHOT_KEYWORDS = {"screenshot", "screen_shot", "screen-shot", "screen shot", "截图", "截屏"}
 DOC_THRESHOLD = 0.5
-BATCH_SIZE = 256
-PREPROCESS_WORKERS = 8
+BATCH_SIZE = 48
+CHUNK_SIZE = 12
+PREPROCESS_WORKERS = 6
+PREFETCH = 4
 
 
 def _fast_hash(filepath, file_size):
@@ -67,15 +72,16 @@ def _should_skip_dir(dirpath):
 
 
 def main():
+    from doc_detector import CACHE_MODEL_VERSION
+
     logger.info("=" * 60)
-    logger.info("全量文档检测扫描")
+    logger.info("全量文档检测扫描 [%s]", CACHE_MODEL_VERSION)
     logger.info("源目录: %s", SOURCE_DIR)
     logger.info("缓存目录: %s", CACHE_DIR)
     logger.info("输出目录: %s", DOC_OUTPUT_DIR)
     logger.info("阈值: %.2f", DOC_THRESHOLD)
     logger.info("=" * 60)
 
-    # 1. 扫描所有图片（跳过 NSFW、人物相册、文档图片目录）
     logger.info("扫描图片文件...")
     t0 = time.time()
     all_images = []
@@ -99,7 +105,6 @@ def main():
     logger.info("扫描完成: %d 张图片 + %d 张截图，耗时 %.1f 秒",
                 len(all_images), len(screenshot_images), scan_time)
 
-    # 2. 计算哈希
     logger.info("计算文件哈希...")
     t1 = time.time()
     file_hashes = {}
@@ -113,84 +118,124 @@ def main():
     hash_time = time.time() - t1
     logger.info("哈希完成: %d 个文件，耗时 %.1f 秒", len(file_hashes), hash_time)
 
-    # 3. 加载文档检测缓存
     os.makedirs(CACHE_DIR, exist_ok=True)
     cache_path = os.path.join(CACHE_DIR, "document_score_cache.json")
     doc_cache = {}
     if os.path.isfile(cache_path):
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
-                doc_cache = json.load(f)
-            logger.info("文档缓存已加载: %d 条", len(doc_cache))
+                data = json.load(f)
+            if isinstance(data, dict) and data.get("_model") == CACHE_MODEL_VERSION:
+                doc_cache = {k: v for k, v in data.items() if not k.startswith("_")}
+                logger.info("文档缓存已加载 [%s]: %d 条", CACHE_MODEL_VERSION, len(doc_cache))
+            else:
+                old_ver = data.get("_model", "单模型") if isinstance(data, dict) else "单模型"
+                logger.info("文档缓存版本不匹配 (%s → %s)，将重建", old_ver, CACHE_MODEL_VERSION)
         except Exception as e:
             logger.warning("文档缓存加载失败: %s", e)
 
-    # 分离缓存命中和需检测
+    from doc_detector import fuse_score as _fuse
+
     cached_scores = {}
     need_detect = []
     for fp, fhash in file_hashes.items():
         if fhash in doc_cache:
-            cached_scores[fp] = doc_cache[fhash]
+            cached = doc_cache[fhash]
+            if isinstance(cached, (list, tuple)) and len(cached) == 2:
+                cached_scores[fp] = _fuse(cached[0], cached[1])
+            else:
+                cached_scores[fp] = float(cached)
         else:
             need_detect.append(fp)
 
     logger.info("缓存命中: %d, 需检测: %d", len(cached_scores), len(need_detect))
 
-    # 4. 运行文档检测
     new_scores = {}
     if need_detect:
-        from doc_detector import DocumentDetector, preprocess_single
+        from doc_detector import DocumentDetector, fuse_score
         detector = DocumentDetector(threshold=DOC_THRESHOLD)
         detector._ensure_model()
 
-        logger.info("开始文档检测: %d 张图片 (batch=%d, %d 预处理线程)",
-                    len(need_detect), BATCH_SIZE, PREPROCESS_WORKERS)
+        logger.info("开始文档检测 [%s]: %d 张图片 (batch=%d, %d 预处理线程)",
+                    CACHE_MODEL_VERSION, len(need_detect), BATCH_SIZE, PREPROCESS_WORKERS)
 
         batches = [need_detect[i:i + BATCH_SIZE] for i in range(0, len(need_detect), BATCH_SIZE)]
         processed = 0
         save_interval = 2000
 
+        def _save():
+            save_data = dict(doc_cache)
+            save_data["_model"] = CACHE_MODEL_VERSION
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(save_data, f)
+
         with tqdm(total=len(need_detect), desc="文档检测", unit="个") as pbar:
-            pool = ThreadPoolExecutor(max_workers=PREPROCESS_WORKERS)
+            from doc_detector import preprocess_chunk
+            from concurrent.futures import ProcessPoolExecutor as _PPE
+            try:
+                pool = _PPE(max_workers=PREPROCESS_WORKERS)
+            except Exception:
+                logger.info("ProcessPoolExecutor 不可用，回退到线程池")
+                pool = ThreadPoolExecutor(max_workers=PREPROCESS_WORKERS)
 
-            for bi, batch_files in enumerate(batches):
-                futs = [(fp, pool.submit(preprocess_single, fp)) for fp in batch_files]
+            def _submit_batch(batch_fps):
+                chunks = []
+                for ci in range(0, len(batch_fps), CHUNK_SIZE):
+                    chunk_fps = batch_fps[ci:ci + CHUNK_SIZE]
+                    chunks.append((chunk_fps, pool.submit(
+                        preprocess_chunk, chunk_fps)))
+                return chunks
 
-                arrays, valid_fps = [], []
-                for fp, fut in futs:
-                    arr = fut.result()
-                    if arr is not None:
-                        arrays.append(arr)
-                        valid_fps.append(fp)
+            from collections import deque
+            pq = deque()
+            pf_end = min(PREFETCH, len(batches))
+            for pi in range(pf_end):
+                pq.append(_submit_batch(batches[pi]))
+            next_sub = pf_end
 
-                if arrays:
+            for bi in range(len(batches)):
+                current = pq.popleft()
+                if next_sub < len(batches):
+                    pq.append(_submit_batch(batches[next_sub]))
+                    next_sub += 1
+
+                arrays_a, arrays_b, valid_fps = [], [], []
+                for chunk_fps, fut in current:
+                    results = fut.result()
+                    for fp, res in zip(chunk_fps, results):
+                        if res is not None:
+                            arr_a, arr_b = res
+                            arrays_a.append(arr_a)
+                            arrays_b.append(arr_b)
+                            valid_fps.append(fp)
+
+                if arrays_a:
                     try:
-                        scores = detector.run_batch_inference(np.stack(arrays))
+                        raw_pairs = detector.run_batch_inference(
+                            np.stack(arrays_a), np.stack(arrays_b),
+                        )
                     except Exception as e:
                         logger.debug("batch 推理异常: %s", e)
-                        scores = [0.0] * len(arrays)
-                    for fp, score in zip(valid_fps, scores):
-                        new_scores[fp] = score
+                        raw_pairs = [(0.0, 0.0)] * len(arrays_a)
+                    for fp, (sa, sb) in zip(valid_fps, raw_pairs):
+                        new_scores[fp] = fuse_score(sa, sb)
                         fhash = file_hashes.get(fp)
                         if fhash:
-                            doc_cache[fhash] = score
+                            doc_cache[fhash] = [sa, sb]
 
-                pbar.update(len(batch_files))
-                processed += len(batch_files)
+                pbar.update(len(batches[bi]))
+                processed += len(batches[bi])
 
                 if processed >= save_interval:
-                    with open(cache_path, "w", encoding="utf-8") as f:
-                        json.dump(doc_cache, f)
+                    _save()
                     processed = 0
 
-            pool.shutdown(wait=False)
+            pool.shutdown(wait=True)
 
-        # 最终保存缓存
-        with open(cache_path, "w", encoding="utf-8") as f:
-            json.dump(doc_cache, f)
-        logger.info("文档缓存已保存: %d 条 → %s", len(doc_cache), cache_path)
+        _save()
+        logger.info("文档缓存已保存 [%s]: %d 条 → %s",
+                    CACHE_MODEL_VERSION, len(doc_cache), cache_path)
 
-    # 5. 汇总结果
     all_scores = {**cached_scores, **new_scores}
     doc_files = [(fp, s) for fp, s in all_scores.items() if s >= DOC_THRESHOLD]
     doc_files.sort(key=lambda x: -x[1])
@@ -208,14 +253,12 @@ def main():
             rel = os.path.relpath(fp, SOURCE_DIR)
             logger.info("  %.3f %s", score, rel)
 
-    # 6. 复制文档图片到 All_7_文档图片
     logger.info("\n" + "=" * 60)
     logger.info("复制文档图片到 %s", DOC_OUTPUT_DIR)
 
     copied = 0
     skipped = 0
 
-    # 6a. 截图 → All_7_文档图片/截图/
     for fp in screenshot_images:
         rel = os.path.relpath(fp, SOURCE_DIR)
         dest = os.path.join(SCREENSHOT_OUTPUT_DIR, rel)
@@ -235,7 +278,6 @@ def main():
 
     logger.info("截图硬链接/复制: %d 个, 已存在跳过: %d 个", copied, skipped)
 
-    # 6b. 模型检出的文档 → All_7_文档图片/{原始相对路径}
     doc_copied = 0
     doc_skipped = 0
     for fp, score in doc_files:
@@ -262,7 +304,7 @@ def main():
     logger.info("完成!")
     logger.info("  All_7_文档图片 总计: %d 个文件 (%d 截图 + %d 模型检出)",
                 total_in_doc, copied, doc_copied)
-    logger.info("  文档缓存: %d 条 → %s", len(doc_cache), cache_path)
+    logger.info("  文档缓存 [%s]: %d 条 → %s", CACHE_MODEL_VERSION, len(doc_cache), cache_path)
     logger.info("  硬链接不占额外磁盘空间")
     logger.info("=" * 60)
 

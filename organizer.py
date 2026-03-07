@@ -260,6 +260,22 @@ def _build_device_label(info: PhotoInfo) -> str:
         if os.path.normcase(info.filepath).startswith(os.path.normcase(src_dir) + os.sep):
             label = f"{label} ({suffix})"
             break
+    else:
+        # 7. 从输出目录的设备文件夹名继承后缀（防止 wz 等自定义后缀丢失）
+        _out = config.REPORT_DIR
+        if _out:
+            _snc = os.path.normcase(info.filepath)
+            _onc = os.path.normcase(_out) + os.sep
+            if _snc.startswith(_onc):
+                _parts = info.filepath[len(_out) + 1:].split(os.sep)
+                if len(_parts) >= 3:
+                    _top = _parts[0].lower()
+                    if any(_top.startswith(p) for p in
+                           ("all_1_", "all_2_", "all_3_", "all_4_", "all_5_")):
+                        _existing = _parts[1]
+                        _m = re.match(r'^(.+?)\s*\((\w+)\)$', _existing)
+                        if _m and _m.group(1).strip().lower() == label.lower():
+                            label = _existing
 
     return label
 
@@ -510,8 +526,18 @@ def _prepare_one(
     item = _PreparedItem(info=info, device_type=device_type, record=record,
                          is_target=is_target, is_screenshot=screenshot, is_dji=is_dji)
 
-    # ── 设备过滤（截图和 DJI 不受设备过滤影响） ──
-    if not screenshot and not is_dji:
+    # 文件已在输出目录的已分类文件夹中 → 跳过设备过滤，后续路由会保留原位
+    _src_already_classified = False
+    if config.REPORT_DIR:
+        _snc = os.path.normcase(info.filepath)
+        _onc = os.path.normcase(config.REPORT_DIR) + os.sep
+        if _snc.startswith(_onc):
+            _top = _snc[len(_onc):].split(os.sep)[0]
+            _CLS = ("all_1_", "all_2_", "all_3_", "all_4_", "all_5_", "all_7_", "all_999_")
+            _src_already_classified = any(_top.startswith(p) for p in _CLS)
+
+    # ── 设备过滤（截图和 DJI 不受设备过滤影响，已分类文件跳过） ──
+    if not screenshot and not is_dji and not _src_already_classified:
         if device_type == DeviceType.UNKNOWN:
             should_copy_unknown = (
                 copy_unknown
@@ -531,8 +557,9 @@ def _prepare_one(
                 item.needs_copy = False
                 return item
 
-    # ── 小图过滤 ──
-    if device_type == DeviceType.UNKNOWN and should_filter_small_image(info):
+    # ── 小图过滤（已分类文件夹中的文件跳过） ──
+    if (not _src_already_classified
+            and device_type == DeviceType.UNKNOWN and should_filter_small_image(info)):
         record.status = "skipped_filtered"
         item.needs_copy = False
         return item
@@ -1074,33 +1101,45 @@ def _run_nsfw_detection(items: List[_PreparedItem], detector, max_workers: int):
 
 
 def _load_document_cache(cache_path: str) -> dict:
-    """加载文档检测分数缓存 {file_hash: score}"""
+    """加载文档检测分数缓存 {file_hash: score}，校验模型版本"""
+    from doc_detector import CACHE_MODEL_VERSION
     if os.path.isfile(cache_path):
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            logger.info("文档检测缓存命中 %d 条: %s", len(data), cache_path)
-            return data
+            if isinstance(data, dict) and data.get("_model") == CACHE_MODEL_VERSION:
+                scores = {k: v for k, v in data.items() if not k.startswith("_")}
+                logger.info("文档检测缓存命中 %d 条 [%s]: %s",
+                            len(scores), CACHE_MODEL_VERSION, cache_path)
+                return scores
+            old_ver = data.get("_model", "单模型") if isinstance(data, dict) else "单模型"
+            logger.info("文档检测缓存版本不匹配 (%s → %s)，将重建",
+                        old_ver, CACHE_MODEL_VERSION)
         except Exception as e:
             logger.debug("文档检测缓存加载失败: %s", e)
     return {}
 
 
 def _save_document_cache(cache_path: str, cache: dict) -> None:
-    """增量保存文档检测分数缓存"""
+    """增量保存文档检测分数缓存（含模型版本标记）"""
+    from doc_detector import CACHE_MODEL_VERSION
     try:
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        save_data = dict(cache)
+        save_data["_model"] = CACHE_MODEL_VERSION
         with open(cache_path, "w", encoding="utf-8") as f:
-            json.dump(cache, f)
-        logger.info("文档检测缓存已保存: %d 条 → %s", len(cache), cache_path)
+            json.dump(save_data, f)
+        logger.info("文档检测缓存已保存: %d 条 [%s] → %s",
+                     len(cache), CACHE_MODEL_VERSION, cache_path)
     except Exception as e:
         logger.debug("文档检测缓存保存失败: %s", e)
 
 
 def _run_document_detection(items: List[_PreparedItem], detector, max_workers: int):
-    """阶段 1.6：文档图片 batch 检测（单阶段，GPU 加速，支持缓存）"""
-    from doc_detector import preprocess_single as _doc_preprocess
+    """阶段 1.6：双模型集成文档检测（docornot + doctype, 条件融合v2, GPU 加速, 支持缓存）"""
+    from doc_detector import preprocess_chunk as _doc_preprocess_chunk
     from doc_detector import _RAW_EXTENSIONS as _DOC_RAW_EXTS
+    from doc_detector import fuse_score as _fuse_score
     import numpy as np
 
     image_exts = config.IMAGE_EXTENSIONS
@@ -1108,6 +1147,7 @@ def _run_document_detection(items: List[_PreparedItem], detector, max_workers: i
     image_items = []
     raw_skipped = 0
     screenshot_skipped = 0
+    camera_skipped = 0
     for it in items:
         if not it.needs_copy:
             continue
@@ -1115,6 +1155,9 @@ def _run_document_detection(items: List[_PreparedItem], detector, max_workers: i
             screenshot_skipped += 1
             continue
         if it.is_dji:
+            continue
+        if it.device_type == DeviceType.CAMERA:
+            camera_skipped += 1
             continue
         ext = os.path.splitext(it.info.filepath)[1].lower()
         if ext in _DOC_RAW_EXTS:
@@ -1130,6 +1173,8 @@ def _run_document_detection(items: List[_PreparedItem], detector, max_workers: i
 
     if raw_skipped:
         logger.info(f"文档检测跳过 RAW: {raw_skipped} 个")
+    if camera_skipped:
+        logger.info(f"文档检测跳过相机照片: {camera_skipped} 个")
     if screenshot_skipped:
         logger.info(f"文档检测跳过截图: {screenshot_skipped} 个（默认归入文档类）")
 
@@ -1148,18 +1193,25 @@ def _run_document_detection(items: List[_PreparedItem], detector, max_workers: i
     for it in image_items:
         h = it.file_hash
         if h and h in doc_cache:
-            it.document_score = doc_cache[h]
+            cached = doc_cache[h]
+            if isinstance(cached, (list, tuple)) and len(cached) == 2:
+                it.document_score = _fuse_score(cached[0], cached[1])
+            else:
+                it.document_score = float(cached)
             cached_count += 1
         else:
             need_detect.append(it)
 
-    BATCH_SIZE = 256
-    PREPROCESS_WORKERS = min(max_workers, 8)
+    BATCH_SIZE = 48
+    CHUNK_SIZE = 12
+    PREPROCESS_WORKERS = min(max_workers, 6)
+    PREFETCH = 4
 
     logger.info(
-        f"文档检测: {len(image_items)} 图片, "
+        f"文档检测 [ensemble-v2]: {len(image_items)} 图片, "
         f"缓存命中 {cached_count}, 需检测 {len(need_detect)} "
-        f"(batch={BATCH_SIZE}, {PREPROCESS_WORKERS} 预处理线程)"
+        f"(batch={BATCH_SIZE}, chunk={CHUNK_SIZE}, "
+        f"{PREPROCESS_WORKERS} 进程, prefetch={PREFETCH})"
     )
 
     save_interval = 2000
@@ -1167,44 +1219,65 @@ def _run_document_detection(items: List[_PreparedItem], detector, max_workers: i
     with tqdm(total=len(image_items), desc="文档检测", unit="个", initial=cached_count) as pbar:
         if need_detect and not is_interrupted():
             detector._ensure_model()
-            pool = ThreadPoolExecutor(max_workers=PREPROCESS_WORKERS)
+
+            from concurrent.futures import ProcessPoolExecutor as _PPE
+            try:
+                pool = _PPE(max_workers=PREPROCESS_WORKERS)
+            except Exception:
+                logger.info("ProcessPoolExecutor 不可用，回退到线程池")
+                pool = ThreadPoolExecutor(max_workers=PREPROCESS_WORKERS)
 
             batches = [need_detect[i:i + BATCH_SIZE]
                        for i in range(0, len(need_detect), BATCH_SIZE)]
 
             def _submit_preprocess(batch_items):
-                return [(it, pool.submit(_doc_preprocess, it.info.filepath))
-                        for it in batch_items]
+                chunks = []
+                for ci in range(0, len(batch_items), CHUNK_SIZE):
+                    chunk = batch_items[ci:ci + CHUNK_SIZE]
+                    fps = [it.info.filepath for it in chunk]
+                    chunks.append((chunk, pool.submit(
+                        _doc_preprocess_chunk, fps)))
+                return chunks
 
-            pending = _submit_preprocess(batches[0])
+            from collections import deque
+            pq = deque()
+            pf_end = min(PREFETCH, len(batches))
+            for pi in range(pf_end):
+                pq.append(_submit_preprocess(batches[pi]))
+            next_sub = pf_end
             processed_since_save = 0
 
             for bi in range(len(batches)):
                 if is_interrupted():
                     break
 
-                current = pending
-                if bi + 1 < len(batches):
-                    pending = _submit_preprocess(batches[bi + 1])
+                current = pq.popleft()
+                if next_sub < len(batches):
+                    pq.append(_submit_preprocess(batches[next_sub]))
+                    next_sub += 1
 
-                arrays, valid_items = [], []
-                for it, fut in current:
-                    arr = fut.result()
-                    if arr is not None:
-                        arrays.append(arr)
-                        valid_items.append(it)
+                arrays_a, arrays_b, valid_items = [], [], []
+                for chunk_items, fut in current:
+                    results = fut.result()
+                    for it, res in zip(chunk_items, results):
+                        if res is not None:
+                            arr_a, arr_b = res
+                            arrays_a.append(arr_a)
+                            arrays_b.append(arr_b)
+                            valid_items.append(it)
 
-                if arrays:
+                if arrays_a:
                     try:
-                        import numpy as np
-                        scores = detector.run_batch_inference(np.stack(arrays))
+                        raw_pairs = detector.run_batch_inference(
+                            np.stack(arrays_a), np.stack(arrays_b),
+                        )
                     except Exception as e:
                         logger.debug("文档检测 batch 推理异常: %s", e)
-                        scores = [0.0] * len(arrays)
-                    for it, score in zip(valid_items, scores):
-                        it.document_score = score
+                        raw_pairs = [(0.0, 0.0)] * len(arrays_a)
+                    for it, (sa, sb) in zip(valid_items, raw_pairs):
+                        it.document_score = _fuse_score(sa, sb)
                         if it.file_hash:
-                            doc_cache[it.file_hash] = score
+                            doc_cache[it.file_hash] = [sa, sb]
 
                 batch_len = len(batches[bi])
                 pbar.update(batch_len)
@@ -1213,13 +1286,13 @@ def _run_document_detection(items: List[_PreparedItem], detector, max_workers: i
                     _save_document_cache(cache_path, doc_cache)
                     processed_since_save = 0
 
-            pool.shutdown(wait=False)
+            pool.shutdown(wait=True)
 
     if cache_path and doc_cache:
         _save_document_cache(cache_path, doc_cache)
 
     doc_found = sum(1 for it in image_items if it.document_score >= detector.threshold)
-    logger.info(f"文档检测完成: 检出 {doc_found} 个文档图片")
+    logger.info(f"文档检测完成 [ensemble-v2]: 检出 {doc_found} 个文档图片")
 
 
 def copy_photos_parallel(
@@ -1462,6 +1535,9 @@ def copy_photos_parallel(
     dji_accepted: List[_PreparedItem] = []  # 通过去重的 DJI 项（含 dry_run）
 
     nsfw_prefix = (os.path.normcase(config.DEST_NSFW) + os.sep) if config.DEST_NSFW else ""
+    _output_norm = (os.path.normcase(config.REPORT_DIR) + os.sep) if config.REPORT_DIR else ""
+    _KEEP_PREFIXES = ("all_1_", "all_2_", "all_3_", "all_4_", "all_5_", "all_7_", "all_999_")
+    _unknown_norm = (os.path.normcase(config.DEST_UNKNOWN) + os.sep) if config.DEST_UNKNOWN else ""
 
     for item in items:
         if not item.needs_copy:
@@ -1469,27 +1545,58 @@ def copy_photos_parallel(
 
         item.record.file_hash = item.file_hash
 
+        # 检查源文件是否已在输出目录的已分类设备文件夹中
+        _src_in_device_folder = False
+        _src_frozen = False  # 已在 NSFW / 文档图片等特殊目录，保留原位
+        if _output_norm:
+            _snc = os.path.normcase(item.info.filepath)
+            if _snc.startswith(_output_norm):
+                _top = _snc[len(_output_norm):].split(os.sep)[0]
+                _src_in_device_folder = any(_top.startswith(p) for p in _KEEP_PREFIXES)
+                _src_frozen = _top.startswith("all_999_") or _top.startswith("all_7_")
+
+        # NSFW / 文档图片文件夹中的文件直接保留原位，不参与任何重新路由
+        if _src_frozen:
+            item.record.destination = item.info.filepath
+
         # 截图路由：截图文件重定向到文档图片/截图目录
-        if item.is_screenshot and config.DEST_SCREENSHOT:
+        if not _src_frozen and item.is_screenshot and config.DEST_SCREENSHOT:
             item.record.destination = _build_screenshot_dest(item)
 
-        # 文档路由：高分文档图片重定向到文档图片目录（跳过截图、DJI）
-        if (not item.is_screenshot and not item.is_dji
+        # 文档路由：高分文档图片重定向到文档图片目录（跳过截图、DJI、相机）
+        if (not _src_frozen and not item.is_screenshot and not item.is_dji
+                and item.device_type != DeviceType.CAMERA
                 and item.document_score >= 0
                 and doc_detector and item.document_score >= doc_detector.threshold
                 and config.DEST_DOCUMENT):
             item.record.destination = _build_document_dest(item)
 
         # DJI 路由：DJI 文件重定向到 DJI 专属目录
-        if item.is_dji and config.DEST_DJI:
+        if not _src_frozen and item.is_dji and config.DEST_DJI:
             item.record.destination = _build_dji_dest_path(item)
 
         # NSFW 路由：nsfw_copy=True 时移到 NSFW 目录，否则仅标记不移动
         is_nsfw = (nsfw_detector and item.nsfw_score >= nsfw_detector.threshold)
         if is_nsfw:
             item.record.extra_info["nsfw_score"] = f"{item.nsfw_score:.3f}"
-        if is_nsfw and nsfw_copy and config.DEST_NSFW:
+        if not _src_frozen and is_nsfw and nsfw_copy and config.DEST_NSFW:
             item.record.destination = _build_nsfw_dest(item)
+
+        # 防降级：已在设备文件夹的文件不被分到未识别设备目录
+        if _src_in_device_folder and _unknown_norm:
+            _dst_nc = os.path.normcase(item.record.destination)
+            if _dst_nc.startswith(_unknown_norm):
+                item.record.destination = item.info.filepath
+
+        # 目标 == 源（文件已在正确位置）→ 标记为已就位，注册哈希防止重复
+        if os.path.normcase(item.record.destination) == os.path.normcase(item.info.filepath):
+            if item.file_hash not in seen_hashes:
+                seen_hashes[item.file_hash] = item.info.filepath
+            item.record.status = "ok"
+            item.needs_copy = False
+            if item.is_dji:
+                dji_accepted.append(item)
+            continue
 
         if item.file_hash in seen_hashes:
             existing = seen_hashes[item.file_hash]
@@ -1540,6 +1647,9 @@ def copy_photos_parallel(
                     continue
                 seen_companions.add(nc)
                 comp_dest = os.path.join(dest_dir, fname)
+                # 伴随文件已在正确位置 → 跳过
+                if os.path.normcase(comp_dest) == nc:
+                    continue
                 comp_dest = _resolve_conflict(comp_dest, assigned_dests)
                 assigned_dests.add(os.path.normcase(comp_dest))
                 try:

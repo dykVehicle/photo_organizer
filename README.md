@@ -276,6 +276,10 @@ python main.py --copy-unknown --scan-dirs "G:\相册_G"
 
 ```bash
 # 不限设备 + 也复制未识别的照片（不含未识别视频）
+python main.py --dry-run --copy-all --copy-unknown-photo --output-dir "H:\All_相册_20260307" --scan-dirs "H:\All_相册_20260307" #仅扫描，不复制和移动文件
+
+python main.py --copy-all --copy-unknown-photo --output-dir "H:\All_相册_20260307" --scan-dirs "H:\All_相册_20260307" #扫描，并且复制和移动文件
+
 python main.py --copy-all --copy-unknown-photo --output-dir "H:\All_相册_20260307" --scan-dirs "E:\相册_E" "F:\相册_F" "G:\相册_G" "I:\相册_I" "S:\media_3t\相册_rpi" "H:\Backup\" "H:\All_相册_20260305\" "H:\All_相册_20260306\" "H:\相册源文件\"
 
 python main.py --copy-all --copy-unknown-photo --output-dir "H:\All_相册_20260306" --scan-dirs "H:\All_相册_20260305\" "H:\Backup\" "H:\相册备份_20260301\" "H:\相册源文件\"
