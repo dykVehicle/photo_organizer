@@ -72,8 +72,14 @@ H:\All_相册\
   │   └── Nikon D750\               ← 简化 "NIKON CORPORATION NIKON D750"
   │       └── 2024-Q3-M7-8-9\
   ├── All_6_其他设备_未识别设备照片\  ← 未识别设备（按时间分文件夹）
-  ├── All_7_NSFW\                    ← 需 --nsfw 才会有
-  ├── All_8_截图\                    ← 截图文件
+  ├── All_7_文档图片\                ← 文档类图片（默认开启）
+  │   ├── 截图\                      ← 截图文件归入此子目录
+  │   │   └── {设备名}/{年-季度}/
+  │   ├── All_1_目标设备_手机照片\    ← 模型检出的文档图片
+  │   │   └── {设备名}/{年-季度}/
+  │   └── ...
+  ├── All_999_NSFW\                  ← 需 --nsfw 才会有
+  ├── All_F_人物相册\                ← 需 --face 才会有
   ├── 整理报告_xxx.html
   └── 整理报告_xxx.csv
 ```
@@ -107,8 +113,53 @@ MVI_0003.MP4  | 2024-01-15 10:32:00 | 156.7MB | Canon EOS R5 |                  
 - 视频自动抽帧检测（ffmpeg 提取关键帧）
 - 检测结果缓存到目标盘根目录（`H:\.photo_organizer\nsfw_score_cache.json`），跨输出目录自动复用，断点续检
 - 中文路径兼容（绕过 OpenCV imread 的 Unicode 限制）
-- 检出文件隔离到 `All_7_NSFW` 目录
+- 检出文件隔离到 `All_999_NSFW` 目录
 - 默认开启，依赖未安装时自动跳过；可用 `--no-nsfw` 手动关闭
+
+## 文档图片检测
+
+默认开启，通过 `--no-document` 禁用。使用 Mozilla/docornot 模型（DeiT-tiny, ONNX）区分文档类图片（证件、发票、书页、截图等）和自然照片。
+
+| 属性 | 值 |
+|---|---|
+| 模型 | mozilla/docornot (DeiT-tiny, 5.5M 参数) |
+| 推理格式 | ONNX (GPU/CPU 自动回退) |
+| 输入 | 224×224, ImageNet 归一化 |
+| 分类 | picture (0) / document (1) |
+| 默认阈值 | 0.5 |
+
+检测特性：
+- 仅检测图片文件（视频不参与文档检测）
+- 跳过 RAW 文件和已识别的截图（截图默认归入文档类）
+- 跳过 DJI 文件
+- GPU (CUDA) batch 推理 + CPU 预处理双缓冲流水线
+- 检测结果缓存到 `H:\.photo_organizer\document_score_cache.json`，跨输出目录自动复用
+- 检出的文档图片路由到 `All_7_文档图片/{原始分类相对路径}`，保留设备/时间目录结构
+
+截图处理：
+- 截图通过文件名关键词识别（Screenshot、截图、截屏等），直接归入 `All_7_文档图片/截图/`
+- 截图不再经过模型检测，减少不必要的计算
+
+路由优先级（从低到高）：截图 → 文档 → DJI → NSFW（最高，覆盖所有）
+
+### 首次使用
+
+```bash
+# 1. 安装依赖
+pip install optimum[onnxruntime] transformers
+
+# 2. 导出 ONNX 模型（仅需一次，约 22MB）
+python _export_docornot_onnx.py
+
+# 3. 运行（文档检测默认开启）
+python main.py --copy-all --scan-dirs "G:\相册_G"
+
+# 禁用文档检测
+python main.py --no-document --copy-all --scan-dirs "G:\相册_G"
+
+# 调整阈值
+python main.py --document-threshold 0.7 --copy-all --scan-dirs "G:\相册_G"
+```
 
 ## 人脸识别聚类（--face）
 
@@ -225,7 +276,10 @@ python main.py --copy-unknown --scan-dirs "G:\相册_G"
 
 ```bash
 # 不限设备 + 也复制未识别的照片（不含未识别视频）
-python main.py --copy-all --copy-unknown-photo --output-dir "H:\All_相册_20260305" --scan-dirs "E:\相册_E" "F:\相册_F" "G:\相册_G" "I:\相册_I" "S:\media_3t\相册_rpi" "H:\Backup\" "H:\All_相册_20260303\" "H:\相册源文件\"
+python main.py --copy-all --copy-unknown-photo --output-dir "H:\All_相册_20260307" --scan-dirs "E:\相册_E" "F:\相册_F" "G:\相册_G" "I:\相册_I" "S:\media_3t\相册_rpi" "H:\Backup\" "H:\All_相册_20260305\" "H:\All_相册_20260306\" "H:\相册源文件\"
+
+python main.py --copy-all --copy-unknown-photo --output-dir "H:\All_相册_20260306" --scan-dirs "H:\All_相册_20260305\" "H:\Backup\" "H:\相册备份_20260301\" "H:\相册源文件\"
+
 
 # 不限设备 + 复制全部未识别文件（照片+视频）= 复制一切
 python main.py --copy-all --copy-unknown --scan-dirs "G:\相册_G" --output-dir "H:\All_相册"
@@ -277,6 +331,8 @@ python main.py --no-nsfw --scan-dirs "G:\相册_G" --output-dir "H:\All_相册"
 | `--copy-unknown-video` | False | 仅复制未识别的视频 |
 | `--nsfw` / `--no-nsfw` | True | NSFW 两阶段检测（默认开启，依赖缺失自动跳过；`--no-nsfw` 关闭） |
 | `--nsfw-threshold` | 0.5 | NudeNet 精检最终阈值（0.0~1.0） |
+| `--document` / `--no-document` | True | 文档图片检测（默认开启，模型缺失自动跳过；`--no-document` 关闭） |
+| `--document-threshold` | 0.5 | 文档图片检测阈值（0.0~1.0） |
 | `--face` / `--no-face` | False | 人脸识别聚类（默认关闭；`--face` 开启） |
 | `--face-min-cluster` | 2 | 人脸聚类最小样本数（至少出现 N 张照片才建人物文件夹） |
 | `--face-cache-only` | False | 仅检测+缓存嵌入，不聚类不创建相册 |
@@ -285,7 +341,7 @@ python main.py --no-nsfw --scan-dirs "G:\相册_G" --output-dir "H:\All_相册"
 | `--dry-run` | False | 试运行，不实际复制 |
 | `--verbose` / `-v` | False | 显示详细日志 |
 
-> **组合逻辑**：`--copy-all` 控制已识别设备（相机/手机）的品牌过滤，`--copy-unknown*` 控制未识别文件。NSFW 检测默认开启，缓存存放在目标盘根目录（如 `H:\.photo_organizer\`），不同输出目录自动共享。
+> **组合逻辑**：`--copy-all` 控制已识别设备（相机/手机）的品牌过滤，`--copy-unknown*` 控制未识别文件。NSFW 检测和文档检测默认开启，缓存存放在目标盘根目录（如 `H:\.photo_organizer\`），不同输出目录自动共享。
 
 ## DJI 大疆设备处理
 
@@ -352,6 +408,19 @@ DJI 视频/照片的同名非媒体文件（如 `.SRT` 字幕、`.LRF` 低分辨
 - `大小不匹配` / `哈希不匹配`：源文件与目标文件内容不一致，跳过（不删除）
 
 ### 使用方法
+
+
+# dry-run 预览
+python cleanup_source.py --target-dir "H:\All_相册_20260307" --source-dirs "E:\相册_E" "F:\相册_F" "G:\相册_G" "I:\相册_I" "S:\media_3t\相册_rpi"
+
+
+python cleanup_source.py --target-dir "H:\All_相册_20260307\All_1_目标设备_手机照片\Xiaomi 14 23127PN0CC\2025-Q1-M1-2-3" --source-dirs "E:\相册_E" "F:\相册_F" "G:\相册_G" "I:\相册_I" "S:\media_3t\相册_rpi"
+
+python cleanup_source.py --target-dir "H:\All_相册_20260307\All_1_目标设备_手机照片\Xiaomi 14 23127PN0CC\2025-Q1-M1-2-3" --source-dirs "E:\相册_E" "F:\相册_F" "G:\相册_G" "I:\相册_I" "S:\media_3t\相册_rpi"
+
+# 确认后真正删除
+python cleanup_source.py --execute --target-dir "H:\All_相册_20260307" --source-dirs "E:\相册_E" "G:\相册_G"
+
 
 ```bash
 # dry-run（默认，只生成报告不删除）— 先用这个确认

@@ -21,8 +21,9 @@ DEST_DJI_COPYALL_NAME = "All_3_DJI_大疆"
 DEST_OTHER_PHONE_NAME = "All_4_其他设备_手机照片"
 DEST_OTHER_CAMERA_NAME = "All_5_其他设备_相机照片"
 DEST_OTHER_UNKNOWN_NAME = "All_6_其他设备_未识别设备照片"
-DEST_NSFW_NAME = "All_7_NSFW"
-DEST_SCREENSHOT_NAME = "All_8_截图"
+DEST_DOCUMENT_NAME = "All_7_文档图片"
+DEST_SCREENSHOT_SUBDIR = "截图"
+DEST_NSFW_NAME = "All_999_NSFW"
 DEST_FACE_ALBUM_NAME = "All_F_人物相册"
 
 # 运行时由 main.py 设置的完整路径（不要手动修改）
@@ -33,6 +34,7 @@ DEST_UNKNOWN = ""
 DEST_CAMERA_OTHER = ""
 DEST_PHONE_OTHER = ""
 DEST_NSFW = ""
+DEST_DOCUMENT = ""
 DEST_SCREENSHOT = ""
 DEST_FACE_ALBUM = ""
 REPORT_DIR = ""
@@ -366,6 +368,8 @@ XIAOMI_MODEL_NAMES = {
     "21121210g": "POCO F4 GT",
     "m2012k11ag": "POCO F3",
     "m2004j11g": "POCO F2 Pro",
+    # ── Xiaomi Pad 系列 ──
+    "23046rp50c": "Xiaomi Pad 6 Pro",
     # ── Redmi 数字系列 ──
     "23106rn0da": "Redmi 13C",
     "23053rn02y": "Redmi 12",

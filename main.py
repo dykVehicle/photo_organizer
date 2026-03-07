@@ -90,11 +90,20 @@ def parse_args() -> argparse.Namespace:
                    help="修复之前错误产生的 _po 后缀文件（重命名回原始名称）")
 
     p.add_argument("--nsfw", action="store_true", default=True,
-                   help="启用 NSFW 两阶段检测（默认开启）")
+                   help="启用 NSFW 两阶段检测（默认开启，仅扫描标记不移动）")
     p.add_argument("--no-nsfw", action="store_false", dest="nsfw",
                    help="禁用 NSFW 检测")
+    p.add_argument("--nsfw-copy", action="store_true", default=False,
+                   help="将 NSFW 文件复制/移动到 NSFW 专属目录（默认关闭，仅扫描记录）")
     p.add_argument("--nsfw-threshold", type=float, default=0.5,
                    help="NSFW 检测阈值 0.0~1.0（默认 0.5），概率超过此值判定为 NSFW")
+
+    p.add_argument("--document", action="store_true", default=True,
+                   help="启用文档图片检测（默认开启）")
+    p.add_argument("--no-document", action="store_false", dest="document",
+                   help="禁用文档图片检测")
+    p.add_argument("--document-threshold", type=float, default=0.5,
+                   help="文档图片检测阈值 0.0~1.0（默认 0.5）")
 
     p.add_argument("--face", action="store_true", default=False,
                    help="启用人脸识别聚类，生成人物相册硬链接（默认关闭）")
@@ -133,7 +142,8 @@ def _init_dest_paths(args) -> str:
 
     config.DEST_DJI = os.path.join(root, config.DEST_DJI_NAME)
     config.DEST_NSFW = os.path.join(root, config.DEST_NSFW_NAME)
-    config.DEST_SCREENSHOT = os.path.join(root, config.DEST_SCREENSHOT_NAME)
+    config.DEST_DOCUMENT = os.path.join(root, config.DEST_DOCUMENT_NAME)
+    config.DEST_SCREENSHOT = os.path.join(config.DEST_DOCUMENT, config.DEST_SCREENSHOT_SUBDIR)
     config.DEST_FACE_ALBUM = os.path.join(root, config.DEST_FACE_ALBUM_NAME)
     config.REPORT_DIR = args.report_dir or root
     return root
@@ -289,11 +299,27 @@ def main() -> None:
             from nsfw_detector import check_dependencies, NsfwDetector
             check_dependencies()
             nsfw_detector = NsfwDetector(threshold=args.nsfw_threshold)
-            logger.info("NSFW 检测: 已启用（阈值 %.2f）→ %s", args.nsfw_threshold, config.DEST_NSFW)
+            if args.nsfw_copy:
+                logger.info("NSFW 检测: 已启用（阈值 %.2f, 移动到 %s）", args.nsfw_threshold, config.DEST_NSFW)
+            else:
+                logger.info("NSFW 检测: 已启用（阈值 %.2f, 仅扫描标记不移动）", args.nsfw_threshold)
         except ImportError as e:
             logger.warning("NSFW 检测依赖未安装，已跳过: %s", e)
     else:
         logger.info("NSFW 检测: 已禁用（--no-nsfw）")
+
+    # ── 文档图片检测初始化 ──
+    doc_detector = None
+    if args.document:
+        try:
+            from doc_detector import check_dependencies as doc_check, DocumentDetector
+            doc_check()
+            doc_detector = DocumentDetector(threshold=args.document_threshold)
+            logger.info("文档检测: 已启用（阈值 %.2f）→ %s", args.document_threshold, config.DEST_DOCUMENT)
+        except (ImportError, FileNotFoundError) as e:
+            logger.warning("文档检测不可用，已跳过: %s", e)
+    else:
+        logger.info("文档检测: 已禁用（--no-document）")
 
     if args.dry_run:
         logger.info("=== 试运行模式：不会实际复制文件 ===")
@@ -369,6 +395,8 @@ def main() -> None:
             copy_unknown_photo=args.copy_unknown_photo,
             copy_unknown_video=args.copy_unknown_video,
             nsfw_detector=nsfw_detector,
+            nsfw_copy=args.nsfw_copy,
+            doc_detector=doc_detector,
         )
 
         for record in result.records:
@@ -376,10 +404,14 @@ def main() -> None:
                 logger.warning("处理失败: %s → %s", record.source, record.error_msg)
 
         copy_time = time.time() - t2
-        nsfw_msg = f", NSFW {result.nsfw_count}" if result.nsfw_count else ""
+        extra_msg = ""
+        if result.nsfw_count:
+            extra_msg += f", NSFW {result.nsfw_count}"
+        if result.document_count:
+            extra_msg += f", 文档 {result.document_count}"
         logger.info(
             "整理完成: 复制 %d%s, 重复跳过 %d, 非目标 %d, 无设备 %d, 小图过滤 %d, 错误 %d, 耗时 %.1f 秒",
-            result.copied, nsfw_msg, result.skipped_dup, result.skipped_not_target,
+            result.copied, extra_msg, result.skipped_dup, result.skipped_not_target,
             result.skipped_no_device, result.skipped_filtered, result.errors, copy_time,
         )
 
@@ -447,6 +479,8 @@ def main() -> None:
         logger.info("  成功复制:   %d 个", result.copied)
         if result.nsfw_count:
             logger.info("  NSFW 检出:  %d 个", result.nsfw_count)
+        if result.document_count:
+            logger.info("  文档图片:   %d 个", result.document_count)
         logger.info("  重复跳过:   %d 个", result.skipped_dup)
         logger.info("  小图过滤:   %d 个", result.skipped_filtered)
         logger.info("  非目标设备: %d 个", result.skipped_not_target)

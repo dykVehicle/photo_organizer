@@ -149,6 +149,7 @@ class OrganizeResult:
     skipped_not_target: int = 0
     skipped_no_device: int = 0
     nsfw_count: int = 0
+    document_count: int = 0
     errors: int = 0
 
 
@@ -435,6 +436,7 @@ class _PreparedItem:
     _file_mtime: float = 0.0
     _file_ctime: float = 0.0
     nsfw_score: float = -1.0  # -1 表示未检测
+    document_score: float = -1.0  # -1 表示未检测
 
 
 def _make_record(info: PhotoInfo, device_type: DeviceType, is_target: bool = True) -> CopyRecord:
@@ -835,6 +837,17 @@ def _build_screenshot_dest(item: _PreparedItem) -> str:
             return os.path.join(config.DEST_SCREENSHOT, config.NO_EXIF_DATE_FOLDER, filename)
 
 
+def _build_document_dest(item: _PreparedItem) -> str:
+    """为文档图片构建目标路径: All_7_文档图片/{原始分类相对路径}"""
+    original_dest = item.record.destination
+    output_root = config.REPORT_DIR
+    try:
+        rel = os.path.relpath(original_dest, output_root)
+    except ValueError:
+        rel = os.path.basename(original_dest)
+    return os.path.join(config.DEST_DOCUMENT, rel)
+
+
 def _build_dji_dest_path(item: _PreparedItem) -> str:
     """为 DJI 文件构建目标路径: All_3_DJI_大疆/{设备名}/{日期}/{文件名}"""
     info = item.info
@@ -1060,6 +1073,155 @@ def _run_nsfw_detection(items: List[_PreparedItem], detector, max_workers: int):
     logger.info(f"NSFW 检测完成: 检出 {nsfw_found} 个 NSFW 文件")
 
 
+def _load_document_cache(cache_path: str) -> dict:
+    """加载文档检测分数缓存 {file_hash: score}"""
+    if os.path.isfile(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            logger.info("文档检测缓存命中 %d 条: %s", len(data), cache_path)
+            return data
+        except Exception as e:
+            logger.debug("文档检测缓存加载失败: %s", e)
+    return {}
+
+
+def _save_document_cache(cache_path: str, cache: dict) -> None:
+    """增量保存文档检测分数缓存"""
+    try:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+        logger.info("文档检测缓存已保存: %d 条 → %s", len(cache), cache_path)
+    except Exception as e:
+        logger.debug("文档检测缓存保存失败: %s", e)
+
+
+def _run_document_detection(items: List[_PreparedItem], detector, max_workers: int):
+    """阶段 1.6：文档图片 batch 检测（单阶段，GPU 加速，支持缓存）"""
+    from doc_detector import preprocess_single as _doc_preprocess
+    from doc_detector import _RAW_EXTENSIONS as _DOC_RAW_EXTS
+    import numpy as np
+
+    image_exts = config.IMAGE_EXTENSIONS
+
+    image_items = []
+    raw_skipped = 0
+    screenshot_skipped = 0
+    for it in items:
+        if not it.needs_copy:
+            continue
+        if it.is_screenshot:
+            screenshot_skipped += 1
+            continue
+        if it.is_dji:
+            continue
+        ext = os.path.splitext(it.info.filepath)[1].lower()
+        if ext in _DOC_RAW_EXTS:
+            raw_skipped += 1
+            continue
+        if ext in image_exts and it.info.media_type == "photo":
+            image_items.append(it)
+
+    image_items.sort(key=lambda it: it.info.filepath)
+
+    if not image_items:
+        return
+
+    if raw_skipped:
+        logger.info(f"文档检测跳过 RAW: {raw_skipped} 个")
+    if screenshot_skipped:
+        logger.info(f"文档检测跳过截图: {screenshot_skipped} 个（默认归入文档类）")
+
+    dest_drive = os.path.splitdrive(config.DEST_CAMERA or config.REPORT_DIR)[0]
+    if dest_drive:
+        cache_dir = os.path.join(dest_drive + os.sep, CACHE_DIR)
+    elif config.REPORT_DIR:
+        cache_dir = os.path.join(config.REPORT_DIR, CACHE_DIR)
+    else:
+        cache_dir = ""
+    cache_path = os.path.join(cache_dir, "document_score_cache.json") if cache_dir else ""
+    doc_cache = _load_document_cache(cache_path) if cache_path else {}
+
+    cached_count = 0
+    need_detect = []
+    for it in image_items:
+        h = it.file_hash
+        if h and h in doc_cache:
+            it.document_score = doc_cache[h]
+            cached_count += 1
+        else:
+            need_detect.append(it)
+
+    BATCH_SIZE = 256
+    PREPROCESS_WORKERS = min(max_workers, 8)
+
+    logger.info(
+        f"文档检测: {len(image_items)} 图片, "
+        f"缓存命中 {cached_count}, 需检测 {len(need_detect)} "
+        f"(batch={BATCH_SIZE}, {PREPROCESS_WORKERS} 预处理线程)"
+    )
+
+    save_interval = 2000
+
+    with tqdm(total=len(image_items), desc="文档检测", unit="个", initial=cached_count) as pbar:
+        if need_detect and not is_interrupted():
+            detector._ensure_model()
+            pool = ThreadPoolExecutor(max_workers=PREPROCESS_WORKERS)
+
+            batches = [need_detect[i:i + BATCH_SIZE]
+                       for i in range(0, len(need_detect), BATCH_SIZE)]
+
+            def _submit_preprocess(batch_items):
+                return [(it, pool.submit(_doc_preprocess, it.info.filepath))
+                        for it in batch_items]
+
+            pending = _submit_preprocess(batches[0])
+            processed_since_save = 0
+
+            for bi in range(len(batches)):
+                if is_interrupted():
+                    break
+
+                current = pending
+                if bi + 1 < len(batches):
+                    pending = _submit_preprocess(batches[bi + 1])
+
+                arrays, valid_items = [], []
+                for it, fut in current:
+                    arr = fut.result()
+                    if arr is not None:
+                        arrays.append(arr)
+                        valid_items.append(it)
+
+                if arrays:
+                    try:
+                        import numpy as np
+                        scores = detector.run_batch_inference(np.stack(arrays))
+                    except Exception as e:
+                        logger.debug("文档检测 batch 推理异常: %s", e)
+                        scores = [0.0] * len(arrays)
+                    for it, score in zip(valid_items, scores):
+                        it.document_score = score
+                        if it.file_hash:
+                            doc_cache[it.file_hash] = score
+
+                batch_len = len(batches[bi])
+                pbar.update(batch_len)
+                processed_since_save += batch_len
+                if cache_path and processed_since_save >= save_interval:
+                    _save_document_cache(cache_path, doc_cache)
+                    processed_since_save = 0
+
+            pool.shutdown(wait=False)
+
+    if cache_path and doc_cache:
+        _save_document_cache(cache_path, doc_cache)
+
+    doc_found = sum(1 for it in image_items if it.document_score >= detector.threshold)
+    logger.info(f"文档检测完成: 检出 {doc_found} 个文档图片")
+
+
 def copy_photos_parallel(
     photo_infos: List[PhotoInfo],
     max_workers: int = 8,
@@ -1070,12 +1232,15 @@ def copy_photos_parallel(
     copy_unknown_photo: bool = False,
     copy_unknown_video: bool = False,
     nsfw_detector=None,
+    nsfw_copy: bool = False,
+    doc_detector=None,
 ) -> OrganizeResult:
     """
     多阶段并行整理：
       1.   并行：分类 + 设备过滤 + 小图过滤 + 计算哈希
       1.5  NSFW batch 检测（GPU 加速，仅 --nsfw 时）
-      2.   串行：去重 + 路径冲突解决 + NSFW 路由
+      1.6  文档图片 batch 检测（仅 --document 时）
+      2.   串行：去重 + 路径冲突解决 + 文档/NSFW/截图路由
       3.   并行：复制文件
     """
     total = len(photo_infos)
@@ -1264,6 +1429,10 @@ def copy_photos_parallel(
     if nsfw_detector and not is_interrupted():
         _run_nsfw_detection(items, nsfw_detector, max_workers)
 
+    # ── 阶段 1.6：文档图片 batch 检测（GPU 加速） ──
+    if doc_detector and not is_interrupted():
+        _run_document_detection(items, doc_detector, max_workers)
+
     # ── 阶段 2-0：扫描目标盘已有文件，建立哈希索引 ──
     dest_drive = os.path.splitdrive(config.DEST_CAMERA)[0].upper() + os.sep
     reuse_index: Optional[Dict[str, str]] = None
@@ -1300,32 +1469,39 @@ def copy_photos_parallel(
 
         item.record.file_hash = item.file_hash
 
-        # 截图路由：截图文件重定向到截图目录
+        # 截图路由：截图文件重定向到文档图片/截图目录
         if item.is_screenshot and config.DEST_SCREENSHOT:
             item.record.destination = _build_screenshot_dest(item)
+
+        # 文档路由：高分文档图片重定向到文档图片目录（跳过截图、DJI）
+        if (not item.is_screenshot and not item.is_dji
+                and item.document_score >= 0
+                and doc_detector and item.document_score >= doc_detector.threshold
+                and config.DEST_DOCUMENT):
+            item.record.destination = _build_document_dest(item)
 
         # DJI 路由：DJI 文件重定向到 DJI 专属目录
         if item.is_dji and config.DEST_DJI:
             item.record.destination = _build_dji_dest_path(item)
 
-        # NSFW 路由优先于去重：先确定目标路径
-        is_nsfw = (nsfw_detector and item.nsfw_score >= nsfw_detector.threshold and config.DEST_NSFW)
+        # NSFW 路由：nsfw_copy=True 时移到 NSFW 目录，否则仅标记不移动
+        is_nsfw = (nsfw_detector and item.nsfw_score >= nsfw_detector.threshold)
         if is_nsfw:
+            item.record.extra_info["nsfw_score"] = f"{item.nsfw_score:.3f}"
+        if is_nsfw and nsfw_copy and config.DEST_NSFW:
             item.record.destination = _build_nsfw_dest(item)
 
         if item.file_hash in seen_hashes:
             existing = seen_hashes[item.file_hash]
-            # NSFW 文件：仅当 All_7_NSFW 内已有同哈希文件时才跳过
-            if is_nsfw and nsfw_prefix and not os.path.normcase(existing).startswith(nsfw_prefix):
-                pass  # 原位置已有但 NSFW 目录没有，仍需复制
+            if is_nsfw and nsfw_copy and nsfw_prefix and not os.path.normcase(existing).startswith(nsfw_prefix):
+                pass
             else:
                 item.record.status = "skipped_dup"
                 item.record.dup_of = existing
                 item.needs_copy = False
                 continue
 
-        # NSFW 文件记录目标路径，防止同文件重复绕过去重
-        seen_hashes[item.file_hash] = item.record.destination if is_nsfw else item.info.filepath
+        seen_hashes[item.file_hash] = item.record.destination if (is_nsfw and nsfw_copy) else item.info.filepath
 
         resolved = _resolve_conflict(item.record.destination, assigned_dests)
         item.record.destination = resolved
@@ -1502,6 +1678,7 @@ def copy_photos_parallel(
 
     # ── 汇总结果 ──
     nsfw_root = os.path.normcase(config.DEST_NSFW + os.sep) if config.DEST_NSFW else ""
+    doc_root = os.path.normcase(config.DEST_DOCUMENT + os.sep) if config.DEST_DOCUMENT else ""
     result = OrganizeResult(total_found=total)
     result.records = [item.record for item in items]
     if companion_items:
@@ -1509,8 +1686,13 @@ def copy_photos_parallel(
     for record in result.records:
         if record.status in ("ok", "dry_run"):
             result.copied += 1
-            if nsfw_root and os.path.normcase(record.destination).startswith(nsfw_root):
+            norm_dest = os.path.normcase(record.destination)
+            if nsfw_root and norm_dest.startswith(nsfw_root):
                 result.nsfw_count += 1
+            elif record.extra_info.get("nsfw_score"):
+                result.nsfw_count += 1
+            if doc_root and norm_dest.startswith(doc_root):
+                result.document_count += 1
         elif record.status == "skipped_dup":
             result.skipped_dup += 1
         elif record.status == "skipped_exists":
@@ -1531,6 +1713,8 @@ def copy_photos_parallel(
     dest_roots = {config.DEST_CAMERA, config.DEST_PHONE, config.DEST_UNKNOWN}
     if config.DEST_NSFW:
         dest_roots.add(config.DEST_NSFW)
+    if config.DEST_DOCUMENT:
+        dest_roots.add(config.DEST_DOCUMENT)
     if config.DEST_SCREENSHOT:
         dest_roots.add(config.DEST_SCREENSHOT)
     if config.DEST_CAMERA_OTHER:
